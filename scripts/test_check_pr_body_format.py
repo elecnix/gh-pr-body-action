@@ -430,6 +430,62 @@ class TestHtmlCommentMasking(unittest.TestCase):
         self.assertEqual(_patterns(body), set())
 
 
+class TestWholeBodyIsAFileReference(unittest.TestCase):
+    """A body that is only `@/tmp/pr-body.md` is a paste accident, not a body.
+
+    An agent (or a human scripting one) writes the intended body to a temp
+    file and then sets the PR body to the *reference* `@/tmp/pr-body.md`,
+    expecting the tooling to expand it. Nothing expands it, so the PR reaches
+    review with a one-token body that renders as literal text. The whole body
+    must be the reference — a mention or a path inside a real body is prose
+    and is not touched.
+    """
+
+    def test_flag_absolute_tmp_path(self):
+        body = "@/tmp/pr-body.md\n"
+        patterns = _patterns(body)
+        self.assertIn("body-is-file-reference", patterns)
+
+    def test_flag_relative_path(self):
+        body = "@./pr-body.md"
+        self.assertIn("body-is-file-reference", _patterns(body))
+
+    def test_flag_bare_filename(self):
+        body = "@pr-body.md"
+        self.assertIn("body-is-file-reference", _patterns(body))
+
+    def test_flag_home_relative_path(self):
+        body = "@~/notes.txt"
+        self.assertIn("body-is-file-reference", _patterns(body))
+
+    def test_mention_only_body_not_flagged(self):
+        # `@username` is a (useless but valid) mention, not a path — no slash,
+        # no extension. Latent rather than measured.
+        self.assertEqual(_patterns("@username\n"), set())
+
+    def test_team_mention_only_body_not_flagged(self):
+        # `@org/team` has a slash but no file extension; it is a mention.
+        self.assertEqual(_patterns("@org/team\n"), set())
+
+    def test_mention_inside_a_real_body_not_flagged(self):
+        body = (
+            "Thanks @reviewer for the context.\n"
+            "\n"
+            "The fix lands in the next push.\n"
+        )
+        self.assertEqual(_patterns(body), set())
+
+    def test_reference_plus_real_content_not_flagged(self):
+        # Only a body that is *solely* the reference is a paste accident.
+        body = "@/tmp/pr-body.md\n\nReal content under it.\n"
+        self.assertEqual(_patterns(body), set())
+
+    def test_violation_spans_the_whole_body(self):
+        violations = find_violations("@/tmp/pr-body.md\n")
+        self.assertEqual(len(violations), 1)
+        self.assertEqual((violations[0].start, violations[0].end), (1, 1))
+
+
 class TestEmptyBody(unittest.TestCase):
     def test_empty_body_clean(self):
         self.assertEqual(find_violations(""), [])
