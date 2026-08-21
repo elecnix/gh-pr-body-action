@@ -176,3 +176,59 @@ test('empty body yields no findings', async () => {
   assert.deepEqual(await findBadMermaidBlocks(''), []);
   assert.deepEqual(await findBadMermaidBlocks('   \n\n  \n'), []);
 });
+
+// ------------------------------------------------- REST fetch (no gh CLI)
+
+test('_fetchBody hits the REST API with a bearer token, no gh CLI', async () => {
+  const calls = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url, init) => {
+    calls.push({ url, init });
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({ body: 'a clean body', user: { type: 'User' } }),
+    };
+  };
+  try {
+    const { body, bot } = await checker._fetchBody('o/r', 7, 'tok-123');
+    assert.equal(body, 'a clean body');
+    assert.equal(bot, false);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].url, 'https://api.github.com/repos/o/r/pulls/7');
+    assert.equal(calls[0].init.headers.Authorization, 'Bearer tok-123');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('_fetchBody detects a bot author', async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => ({
+    ok: true,
+    status: 200,
+    json: async () => ({ body: '<html>changelog</html>', user: { type: 'Bot' } }),
+  });
+  try {
+    const { body, bot } = await checker._fetchBody('o/r', 7, 'tok');
+    assert.equal(bot, true);
+    assert.ok(body.includes('changelog'));
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('_fetchBody raises on a failed read, never returns a clean body', async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => ({
+    ok: false,
+    status: 404,
+    statusText: 'Not Found',
+    json: async () => ({}),
+  });
+  try {
+    await assert.rejects(() => checker._fetchBody('o/r', 7, 'tok'), /404/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});

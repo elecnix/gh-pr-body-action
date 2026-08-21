@@ -53,7 +53,7 @@ runs:
       id: check
       shell: bash
       env:
-        GH_TOKEN: ${{ inputs.token }}
+        GITHUB_TOKEN: ${{ inputs.token }}
         PR_REPO: ${{ inputs.repo }}
         PR_NUMBER: ${{ inputs.pr }}
         ACTION_DIR: ${{ github.action_path }}

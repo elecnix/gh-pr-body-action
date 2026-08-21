@@ -50,13 +50,13 @@
  * CLI, mirroring the Python sibling. Two input modes, same exit codes:
  *
  *     node scripts/check-pr-body-mermaid.mjs --body-file body.md  # or '-'
- *     node scripts/check-pr-body-mermaid.mjs --repo O/R --pr 1234 # via gh api
+ *     node scripts/check-pr-body-mermaid.mjs --repo O/R --pr 1234 # via the REST API
  *
  *   0  no violations, empty body, or the author is a bot (a dependabot body is
  *      machine HTML nobody will fix).
  *   1  at least one unparsable mermaid block, each printed with its line range
  *      and the mermaid error.
- *   2  invalid usage, a failed `gh api` call, or an unreadable body — a failed
+ *   2  invalid usage, a failed API call, or an unreadable body — a failed
  *      read is never reported as clean.
  *
  * Dependency pinning. mermaid is pinned EXACTLY (no ^) in scripts/package.json
@@ -67,7 +67,6 @@
  */
 
 import { JSDOM } from 'jsdom';
-import { execFileSync } from 'node:child_process';
 
 // ---------------------------------------------------------------- DOM shim
 // Install a minimal jsdom window before mermaid is imported, so DOMPurify's
@@ -193,26 +192,34 @@ export async function findBadMermaidBlocks(body) {
 // ------------------------------------------------------------------ fetching
 
 /**
- * The PR body and whether a bot wrote it, in one REST read. REST, not GraphQL:
- * the repo's shared GraphQL budget is the scarce one, and `gh pr view --json`
- * is GraphQL-backed. A non-zero exit raises rather than returning an empty
- * body, so a failed read can never be mistaken for a PR with nothing wrong in
- * it. Mirrors check-pr-body-format.py.
- * @returns {{body: string, bot: boolean}}
+ * The PR body and whether a bot wrote it, in one REST read.
+ *
+ * A direct HTTPS call via fetch — no gh CLI required, so running the check
+ * needs nothing but a token in the environment (GITHUB_TOKEN or GH_TOKEN).
+ * REST, not GraphQL: the repo's shared GraphQL budget is the scarce one. A
+ * failed read raises rather than returning an empty body, so a failed read can
+ * never be mistaken for a PR with nothing wrong in it. Mirrors
+ * check-pr-body-format.py.
+ * @param {string} repo OWNER/REPO
+ * @param {number} pr pull-request number
+ * @param {string} token GitHub API token
+ * @returns {Promise<{body: string, bot: boolean}>}
  */
-function _fetchBody(repo, pr) {
-  const stdout = execFileSync(
-    'gh',
-    [
-      'api',
-      `repos/${repo}/pulls/${pr}`,
-      '--jq',
-      '{body: (.body // ""), bot: (.user.type == "Bot")}',
-    ],
-    { encoding: 'utf8' },
-  );
-  const payload = JSON.parse(stdout);
-  return { body: payload.body || '', bot: payload.bot === true };
+export async function _fetchBody(repo, pr, token) {
+  const url = `https://api.github.com/repos/${repo}/pulls/${pr}`;
+  const response = await fetch(url, {
+    headers: {
+      Accept: 'application/vnd.github+json',
+      Authorization: `Bearer ${token}`,
+      'X-GitHub-Api-Version': '2022-11-28',
+      'User-Agent': 'gh-pr-body-action',
+    },
+  });
+  if (!response.ok) {
+    throw new Error(`GET ${url} failed (${response.status} ${response.statusText})`);
+  }
+  const payload = await response.json();
+  return { body: payload.body || '', bot: payload.user?.type === 'Bot' };
 }
 
 // ------------------------------------------------------------------------ CLI
@@ -265,7 +272,14 @@ export async function main(argv) {
       }
       bot = false;
     } else {
-      ({ body, bot } = _fetchBody(repo, pr));
+      const token = process.env.GITHUB_TOKEN || process.env.GH_TOKEN;
+      if (!token) {
+        process.stderr.write(
+          'error: no token for the GitHub API call — set GITHUB_TOKEN (or GH_TOKEN)\n',
+        );
+        return 2;
+      }
+      ({ body, bot } = await _fetchBody(repo, pr, token));
     }
   } catch (err) {
     process.stderr.write(`error: ${err?.message || String(err)}\n`);

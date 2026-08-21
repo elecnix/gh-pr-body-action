@@ -84,10 +84,11 @@ python3 scripts/check-pr-body-format.py --body-file body.md   # or '-' for stdin
 cd scripts && npm ci && node check-pr-body-mermaid.mjs --body-file ../body.md
 ```
 
-Or read a live PR:
+Or read a live PR (no gh CLI needed — just a token):
 
 ```
-GH_TOKEN=ghp_... python3 scripts/check-pr-body-format.py --repo OWNER/REPO --pr 1234
+GITHUB_TOKEN=ghp_... python3 scripts/check-pr-body-format.py --repo OWNER/REPO --pr 1234
+cd scripts && node check-pr-body-mermaid.mjs --repo OWNER/REPO --pr 1234
 ```
 
 Unit tests:

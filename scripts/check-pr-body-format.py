@@ -151,9 +151,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
-import subprocess
 import sys
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 
 
@@ -517,37 +519,28 @@ def find_violations(body: str) -> list[Violation]:
     return violations
 
 
-def _fetch_body(repo: str, pr: int) -> tuple[str, bool]:
+def _fetch_body(repo: str, pr: int, token: str) -> tuple[str, bool]:
     """The PR body and whether a bot wrote it, in one REST read.
 
-    REST, not GraphQL: the repo's shared GraphQL budget is the scarce one, and
-    `gh pr view --json` is GraphQL-backed. A non-zero exit raises rather than
-    returning an empty body, so a failed read can never be mistaken for a PR
-    with nothing wrong in it.
+    A direct HTTPS call to the REST API via urllib — no gh CLI required, so
+    running the check needs nothing but a token in the environment. REST, not
+    GraphQL: the repo's shared GraphQL budget is the scarce one. A failed read
+    raises rather than returning an empty body, so it can never be mistaken
+    for a PR with nothing wrong in it.
     """
-    result = subprocess.run(
-        [
-            "gh",
-            "api",
-            f"repos/{repo}/pulls/{pr}",
-            "--jq",
-            "{body: (.body // \"\"), bot: (.user.type == \"Bot\")}",
-        ],
-        capture_output=True,
-        text=True,
+    url = f"https://api.github.com/repos/{repo}/pulls/{pr}"
+    request = urllib.request.Request(
+        url,
+        headers={
+            "Accept": "application/vnd.github+json",
+            "Authorization": f"Bearer {token}",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": "gh-pr-body-action",
+        },
     )
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"gh api repos/{repo}/pulls/{pr} failed ({result.returncode}): "
-            f"{result.stderr.strip()}"
-        )
-    try:
-        payload = json.loads(result.stdout)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(
-            f"gh api repos/{repo}/pulls/{pr} returned unparsable JSON: {exc}"
-        ) from exc
-    return payload.get("body") or "", bool(payload.get("bot"))
+    with urllib.request.urlopen(request, timeout=30) as response:
+        payload = json.load(response)
+    return payload.get("body") or "", payload.get("user", {}).get("type") == "Bot"
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -557,7 +550,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--repo",
-        help="OWNER/REPO to fetch the PR body from via `gh api`",
+        help="OWNER/REPO to fetch the PR body from via the GitHub REST API",
     )
     parser.add_argument(
         "--pr",
@@ -584,8 +577,16 @@ def main(argv: list[str] | None = None) -> int:
                     body = fh.read()
             is_bot = False
         else:
-            body, is_bot = _fetch_body(args.repo, args.pr)
-    except (subprocess.SubprocessError, OSError, RuntimeError, ValueError) as exc:
+            token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+            if not token:
+                print(
+                    "error: no token for the GitHub API call — set GITHUB_TOKEN"
+                    " (or GH_TOKEN)",
+                    file=sys.stderr,
+                )
+                return 2
+            body, is_bot = _fetch_body(args.repo, args.pr, token)
+    except (urllib.error.URLError, OSError, RuntimeError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 

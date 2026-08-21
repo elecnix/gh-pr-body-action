@@ -18,6 +18,7 @@ import importlib.util
 import os
 import sys
 import unittest
+import unittest.mock
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _SCRIPT = os.path.join(_HERE, "check-pr-body-format.py")
@@ -256,34 +257,40 @@ class TestBotAuthoredBodiesAreSkipped(unittest.TestCase):
     def test_bot_author_short_circuits_to_zero(self):
         calls = []
 
-        def fake_fetch(repo, pr):
+        def fake_fetch(repo, pr, token):
             calls.append((repo, pr))
             return ("- item\ncontinuation at column zero\n", True)
 
         original = _CHECKER._fetch_body
         _CHECKER._fetch_body = fake_fetch
         try:
-            rc = _CHECKER.main(["--repo", "o/r", "--pr", "7"])
+            with unittest.mock.patch.dict(
+                os.environ, {"GITHUB_TOKEN": "tok"}
+            ):
+                rc = _CHECKER.main(["--repo", "o/r", "--pr", "7"])
         finally:
             _CHECKER._fetch_body = original
         self.assertEqual(rc, 0)
         self.assertEqual(calls, [("o/r", 7)])
 
     def test_human_author_with_violation_still_red(self):
-        def fake_fetch(repo, pr):
+        def fake_fetch(repo, pr, token):
             return ("- item\ncontinuation at column zero\n", False)
 
         original = _CHECKER._fetch_body
         _CHECKER._fetch_body = fake_fetch
         try:
-            rc = _CHECKER.main(["--repo", "o/r", "--pr", "7"])
+            with unittest.mock.patch.dict(
+                os.environ, {"GITHUB_TOKEN": "tok"}
+            ):
+                rc = _CHECKER.main(["--repo", "o/r", "--pr", "7"])
         finally:
             _CHECKER._fetch_body = original
         self.assertEqual(rc, 1)
 
     def test_failed_read_is_degraded_not_clean(self):
         # A failed API read must never be reported as "no violations".
-        def fake_fetch(repo, pr):
+        def fake_fetch(repo, pr, token):
             raise RuntimeError("gh api failed (1): boom")
 
         original = _CHECKER._fetch_body
@@ -484,6 +491,82 @@ class TestWholeBodyIsAFileReference(unittest.TestCase):
         violations = find_violations("@/tmp/pr-body.md\n")
         self.assertEqual(len(violations), 1)
         self.assertEqual((violations[0].start, violations[0].end), (1, 1))
+
+
+class TestFetchBodyUsesRestApiDirectly(unittest.TestCase):
+    """The checker talks to the REST API over HTTPS — no gh CLI required.
+
+    Shelling out to `gh` made every user install the CLI just to run the
+    check. urllib is in the standard library, so the live-fetch path needs
+    nothing but a token in the environment.
+    """
+
+    def test_fetch_body_hits_rest_api_with_bearer_token(self):
+        import io
+        import json as _json
+        from unittest import mock
+
+        payload = _json.dumps(
+            {"body": "a clean body", "user": {"type": "User"}}
+        ).encode()
+        fake_resp = io.BytesIO(payload)
+        with mock.patch(
+            "urllib.request.urlopen", return_value=fake_resp
+        ) as urlopen:
+            body, is_bot = _CHECKER._fetch_body("o/r", 7, "tok-123")
+        self.assertEqual((body, is_bot), ("a clean body", False))
+        (req,), kwargs = urlopen.call_args
+        self.assertEqual(req.full_url, "https://api.github.com/repos/o/r/pulls/7")
+        self.assertEqual(req.get_header("Authorization"), "Bearer tok-123")
+        self.assertIn("vnd.github+json", req.get_header("Accept"))
+
+    def test_fetch_body_bot_author_detected(self):
+        import io
+        import json as _json
+        from unittest import mock
+
+        payload = _json.dumps(
+            {"body": "<html>changelog</html>", "user": {"type": "Bot"}}
+        ).encode()
+        with mock.patch(
+            "urllib.request.urlopen", return_value=io.BytesIO(payload)
+        ):
+            body, is_bot = _CHECKER._fetch_body("o/r", 7, "tok")
+        self.assertTrue(is_bot)
+
+    def test_missing_token_is_usage_failure_not_clean(self):
+        # A live fetch without a token must exit 2 (read failure), never 0.
+        from unittest import mock
+
+        env = {k: v for k, v in os.environ.items()}
+        env.pop("GITHUB_TOKEN", None)
+        env.pop("GH_TOKEN", None)
+        with mock.patch.dict(os.environ, env, clear=True):
+            rc = _CHECKER.main(["--repo", "o/r", "--pr", "7"])
+        self.assertEqual(rc, 2)
+
+    def test_http_error_is_degraded_not_clean(self):
+        from unittest import mock
+        import urllib.error
+
+        def raise_404(req, **kwargs):
+            raise urllib.error.HTTPError(
+                req.full_url, 404, "Not Found", None, None
+            )
+
+        with mock.patch.dict(
+            os.environ, {"GITHUB_TOKEN": "tok"}
+        ), mock.patch("urllib.request.urlopen", side_effect=raise_404):
+            rc = _CHECKER.main(["--repo", "o/r", "--pr", "7"])
+        self.assertEqual(rc, 2)
+
+    def test_no_gh_subprocess_anywhere_in_the_checker(self):
+        # The point of the change: the source never invokes the gh CLI.
+        with open(_SCRIPT, encoding="utf-8") as fh:
+            source = fh.read()
+        self.assertNotIn("subprocess", source)
+        self.assertNotIn("'gh'", source)
+        self.assertNotIn('"gh"', source)
 
 
 class TestEmptyBody(unittest.TestCase):
