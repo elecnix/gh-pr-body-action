@@ -1,0 +1,46 @@
+name: ci
+
+# Unit tests for both checkers. The dogfood workflow (pr-body-format.yml)
+# exercises the composite action end-to-end on this repo's own PRs; this
+# workflow pins the checker logic itself so a regression re-breaks a test
+# rather than a merge.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test-python-checker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.x'
+
+      # Stdlib unittest only — no install step needed.
+      - name: Python checker unit tests
+        run: python3 scripts/test_check_pr_body_format.py
+
+  test-mermaid-checker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: scripts/package-lock.json
+
+      - name: Install mermaid checker dependencies
+        working-directory: scripts
+        run: npm ci
+
+      - name: Mermaid checker unit tests
+        working-directory: scripts
+        run: npm test
