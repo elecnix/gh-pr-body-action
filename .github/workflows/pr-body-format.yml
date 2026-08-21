@@ -1,0 +1,22 @@
+name: pr-body-format
+
+# The action checking its own repo's PRs — dogfooding, and the live proof the
+# composite action works when consumed as elecnix/gh-pr-body-action@v1.
+# `edited` re-runs the check once the author fixes the body.
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: pr-body-format-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pr-body-format:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: elecnix/gh-pr-body-action@v1
