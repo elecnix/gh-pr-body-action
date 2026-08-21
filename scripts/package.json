@@ -1,0 +1,17 @@
+{
+  "name": "gh-pr-body-action-mermaid-checker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Mermaid-diagram validator for the gh-pr-body-action composite action. Parses ```mermaid fenced blocks in a PR body with the exact mermaid major GitHub renders with, so an unparsable diagram goes red before review.",
+  "scripts": {
+    "test": "node --test test_check_pr_body_mermaid.mjs"
+  },
+  "dependencies": {
+    "jsdom": "^24.1.1",
+    "mermaid": "11.16.1"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

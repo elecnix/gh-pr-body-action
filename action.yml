@@ -1,0 +1,78 @@
+name: 'PR Body Format'
+description: >-
+  Flags a pull-request description that will render badly on GitHub: prose
+  hard-wrapped mid-sentence, list items broken onto a second line, collapsed
+  tables, and mermaid diagrams the mermaid parser rejects.
+author: 'elecnix'
+
+branding:
+  icon: 'file-text'
+  color: 'blue'
+
+inputs:
+  repo:
+    description: 'OWNER/REPO of the pull request to check. Defaults to the repository running the workflow.'
+    required: false
+    default: ${{ github.repository }}
+  pr:
+    description: 'Pull-request number. Defaults to the number from the pull_request event.'
+    required: false
+    default: ${{ github.event.pull_request.number }}
+  token:
+    description: 'GitHub token used to read the PR body. Needs pull-requests: read at minimum.'
+    required: false
+    default: ${{ github.token }}
+  node-version:
+    description: 'Node.js major version used to run the mermaid checker.'
+    required: false
+    default: '22'
+
+outputs:
+  violations:
+    description: 'The combined exit code of the two checkers (0 clean, 1 violation, 2 read/usage failure).'
+    value: ${{ steps.check.outputs.rc }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Set up Node
+      uses: actions/setup-node@v7
+      with:
+        node-version: ${{ inputs.node-version }}
+        cache: npm
+        cache-dependency-path: ${{ github.action_path }}/scripts/package-lock.json
+
+    - name: Install checker dependencies
+      shell: bash
+      working-directory: ${{ github.action_path }}/scripts
+      run: npm ci
+
+    - name: Check PR body formatting
+      id: check
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        PR_REPO: ${{ inputs.repo }}
+        PR_NUMBER: ${{ inputs.pr }}
+        ACTION_DIR: ${{ github.action_path }}
+      run: |
+        if [ -z "$PR_NUMBER" ]; then
+          echo "::notice::No pull-request number available (not a pull_request event); skipping."
+          echo "rc=0" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        # Both checkers run even when one is red, so an author with a wrapped
+        # paragraph AND a bad diagram sees both findings in one run. errexit is
+        # on by default, so capture each rc with it off.
+        set +e
+        python3 "$ACTION_DIR/scripts/check-pr-body-format.py" \
+          --repo "$PR_REPO" --pr "$PR_NUMBER"
+        rc1=$?
+        node "$ACTION_DIR/scripts/check-pr-body-mermaid.mjs" \
+          --repo "$PR_REPO" --pr "$PR_NUMBER"
+        rc2=$?
+        set -e
+        rc=$((rc1 || rc2))
+        echo "rc=$rc" >> "$GITHUB_OUTPUT"
+        exit "$rc"
