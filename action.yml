@@ -39,8 +39,10 @@ runs:
       uses: actions/setup-node@v7
       with:
         node-version: ${{ inputs.node-version }}
-        cache: npm
-        cache-dependency-path: ${{ github.action_path }}/scripts/package-lock.json
+        # No npm cache: setup-node can only cache a lockfile inside the
+        # caller's workspace, and this action's lockfile lives under
+        # github.action_path (_actions/...), which it refuses to resolve.
+        # `npm ci` takes seconds without the cache.
 
     - name: Install checker dependencies
       shell: bash
