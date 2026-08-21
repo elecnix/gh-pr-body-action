@@ -22,6 +22,7 @@ Same input, two surfaces, two results. Hard-wrapping is *correct* in a committed
 | `hard-newline-in-paragraph` | a prose line that stops mid-sentence and continues on the next line | let the line run long; the browser wraps it |
 | `hard-newline-in-list-item` | a `- item` line followed by prose at column zero | indent the continuation by two spaces |
 | `collapsed-table` | header, separator, and data rows pipe-joined onto one line | one row per line |
+| `body-is-file-reference` | the whole body is a single `@/tmp/pr-body.md`-style file reference (the contents were never pasted) | paste the file's contents into the body |
 | `unparsable-mermaid` | a ` ```mermaid ` block the mermaid parser rejects (renders as an error box) | fix the diagram; check it in the mermaid live editor |
 
 The mermaid half runs the real `mermaid.parse()` against mermaid pinned to the 11.x major GitHub renders with, so a diagram fails exactly when GitHub shows an error box.

@@ -52,6 +52,15 @@ Three shapes are flagged:
          Renders as a run of pipes and words, not a table.
          Fix:   one row per line.
 
+  4. **Body is a file reference** — the entire body is a single `@<path>`
+     token, the shape left behind when the intended body was written to a file
+     and the reference was pasted instead of the contents. Nothing expands it,
+     so reviewers open the PR and find no description at all.
+
+         Bad:   @/tmp/pr-body.md
+         Renders as the literal text "@/tmp/pr-body.md".
+         Fix:   paste the file's contents into the body.
+
 Calibrated against the 100 most recent PR bodies (read via the REST list
 endpoint, 2026-08-13), of which 94 are human-authored and 6 are bot-authored and
 skipped. Shape 1 is real and common: 11 of the 94 are hard-wrapped. Shapes 2 and
@@ -190,6 +199,14 @@ _SENTENCE_END = re.compile(r"[.!?][\"'\)\]`]*\s*$")
 # paragraph break. Hyphen-minus is excluded on purpose: a line opening with one
 # is a CLI flag, a `--` placeholder, or a rule, never a sentence continuing.
 _CONTINUATION_START = re.compile(r"^\s*[a-z0-9:;,—–]")
+
+
+# A body that is nothing but a file reference — `@/tmp/pr-body.md` — the shape
+# left behind when the intended body was written to a file and the *reference*
+# was pasted instead of the contents. The token must look like a path (a
+# leading `/`, or a file extension, optionally under directories) so an
+# `@username` or `@org/team` mention-only body is not flagged.
+_FILE_REFERENCE = re.compile(r"^@(?:\S*/\S*\.\w{1,5}|/\S+|\S+\.\w{1,5})$")
 
 
 # How many offending lines to print before summarizing the rest. A hard-wrapped
@@ -465,13 +482,34 @@ def _find_collapsed_tables(lines: list[str]) -> list[Violation]:
     return out
 
 
+def _find_file_reference_body(body: str) -> list[Violation]:
+    """A body whose entire content is one `@<path>` token.
+
+    The reference renders as literal text — nothing expands it — so reviewers
+    open the PR and find no description at all. Only a body that is solely the
+    reference is flagged: a mention inside real prose is ordinary content.
+    """
+    stripped = body.strip()
+    if "\n" in stripped or not _FILE_REFERENCE.match(stripped):
+        return []
+    return [
+        Violation(
+            pattern="body-is-file-reference",
+            start=1,
+            end=1,
+            lines=(stripped,),
+        )
+    ]
+
+
 def find_violations(body: str) -> list[Violation]:
-    """All three formatting bugs in the PR body, in line order."""
+    """All four formatting bugs in the PR body, in line order."""
     if not body:
         return []
     lines = body.split("\n")
     masked = _strip_masked(lines)
     violations: list[Violation] = []
+    violations.extend(_find_file_reference_body(body))
     violations.extend(_find_paragraph_hard_breaks(masked))
     violations.extend(_find_list_item_hard_breaks(masked))
     violations.extend(_find_collapsed_tables(masked))
@@ -577,6 +615,11 @@ def main(argv: list[str] | None = None) -> int:
         "\nFix by separating paragraphs with a blank line, continuing list items"
         " with indentation, or putting each table row on its own line."
     )
+    if any(v.pattern == "body-is-file-reference" for v in violations):
+        print(
+            "The body is a file reference (@path), not content — paste the"
+            " file's contents into the PR body instead of its path."
+        )
     return 1
 
 
