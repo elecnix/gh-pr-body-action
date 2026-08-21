@@ -99,3 +99,5 @@ cd scripts && npm test
 ## Provenance
 
 Extracted from the `pr-body-format` CI gate of a private repo, where it was calibrated against 100 real PR bodies and every suppression is pinned by a test.
+
+<!-- smoke test placeholder -->
