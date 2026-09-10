@@ -34,11 +34,41 @@ inputs:
     description: 'Node.js major version used to run the mermaid checker.'
     required: false
     default: '22'
+  prose:
+    description: >-
+      Lint the description against the calling repository's own prose rules
+      (a .vale.ini in the checkout). On by default. The action ships no rules:
+      a repo without a .vale.ini is skipped, out loud, with the reason. Set to
+      'false' to turn the step off entirely.
+    required: false
+    default: 'true'
+  prose-fail:
+    description: >-
+      Whether a prose finding fails the job. Off by default: the first version
+      of this check reports, and the repo decides when it starts blocking. A
+      prose linter that could not run at all still fails, whatever this is set
+      to — a check that did not start has not passed.
+    required: false
+    default: 'false'
+  prose-rules-dir:
+    description: >-
+      Directory holding the calling repo's .vale.ini. Defaults to the workspace,
+      so `actions/checkout` must run before this action for the prose step to
+      find anything.
+    required: false
+    default: ${{ github.workspace }}
+  vale-version:
+    description: 'Vale release used for the prose step.'
+    required: false
+    default: '3.20.0'
 
 outputs:
   violations:
     description: 'The combined exit code of the two checkers (0 clean, 1 violation, 2 read/usage failure).'
     value: ${{ steps.check.outputs.rc }}
+  prose:
+    description: 'The prose checker exit code (0 clean or skipped, 1 finding, 2 could not run).'
+    value: ${{ steps.prose.outputs.rc }}
 
 runs:
   using: 'composite'
@@ -99,3 +129,60 @@ runs:
         rc=$((rc1 || rc2))
         echo "rc=$rc" >> "$GITHUB_OUTPUT"
         exit "$rc"
+
+    # The prose step runs after the format step and never short-circuits it: an
+    # author with a wrapped paragraph AND an off-house sentence should see both
+    # in one run rather than one per push.
+    - name: Install vale
+      if: ${{ always() && inputs.prose == 'true' && inputs.pr != '' }}
+      shell: bash
+      env:
+        VALE_VERSION: ${{ inputs.vale-version }}
+      run: |
+        set -euo pipefail
+        arch=$(uname -m)
+        case "$arch" in
+          x86_64) asset=64-bit ;;
+          aarch64|arm64) asset=arm64 ;;
+          *) echo "::error::vale has no release asset for $arch"; exit 2 ;;
+        esac
+        url="https://github.com/errata-ai/vale/releases/download/v${VALE_VERSION}/vale_${VALE_VERSION}_Linux_${asset}.tar.gz"
+        # Into RUNNER_TEMP, not /usr/local/bin: the latter needs root on some
+        # self-hosted runners and this step has no reason to need it.
+        bin="${RUNNER_TEMP:-/tmp}/vale-bin"
+        mkdir -p "$bin"
+        curl -fsSL "$url" | tar -xz -C "$bin" vale
+        chmod +x "$bin/vale"
+        echo "$bin" >> "$GITHUB_PATH"
+        "$bin/vale" --version
+
+    - name: Check PR body prose
+      id: prose
+      if: ${{ always() && inputs.prose == 'true' && inputs.pr != '' }}
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ inputs.token }}
+        PR_REPO: ${{ inputs.repo }}
+        PR_NUMBER: ${{ inputs.pr }}
+        RULES_DIR: ${{ inputs.prose-rules-dir }}
+        PROSE_FAIL: ${{ inputs.prose-fail }}
+        ACTION_DIR: ${{ github.action_path }}
+      run: |
+        set +e
+        python3 "$ACTION_DIR/scripts/check-pr-body-prose.py" \
+          --repo "$PR_REPO" --pr "$PR_NUMBER" --rules-dir "$RULES_DIR"
+        rc=$?
+        set -e
+        echo "rc=$rc" >> "$GITHUB_OUTPUT"
+        # rc 2 is "the linter never ran", which is a failure however the repo
+        # has set prose-fail: a check that did not start has not passed.
+        if [ "$rc" -ge 2 ]; then
+          echo "::error::The prose check could not run."
+          exit 1
+        fi
+        if [ "$rc" -eq 1 ] && [ "$PROSE_FAIL" = "true" ]; then
+          exit 1
+        fi
+        if [ "$rc" -eq 1 ]; then
+          echo "::warning::The description does not match this repository's prose rules; see the step log."
+        fi

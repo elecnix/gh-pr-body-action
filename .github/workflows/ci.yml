@@ -26,6 +26,53 @@ jobs:
       - name: Python checker unit tests
         run: python3 scripts/test_check_pr_body_format.py
 
+  test-prose-checker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.x'
+
+      # Vale is a hard requirement here, never a skip. The two tests that matter
+      # both need a real vale run: the one proving a markdown-scoped rule still
+      # fires on a .txt body, and its control proving that body reports clean
+      # without the copy. Skipping them would leave the trap untested while the
+      # suite still reported green.
+      - name: Install vale
+        env:
+          VALE_VERSION: '3.20.0'
+        run: |
+          set -euo pipefail
+          url="https://github.com/errata-ai/vale/releases/download/v${VALE_VERSION}/vale_${VALE_VERSION}_Linux_64-bit.tar.gz"
+          mkdir -p "$RUNNER_TEMP/vale-bin"
+          curl -fsSL "$url" | tar -xz -C "$RUNNER_TEMP/vale-bin" vale
+          chmod +x "$RUNNER_TEMP/vale-bin/vale"
+          echo "$RUNNER_TEMP/vale-bin" >> "$GITHUB_PATH"
+
+      - name: Prose checker unit tests
+        run: |
+          set -euo pipefail
+          command -v vale
+          python3 scripts/test_check_pr_body_prose.py
+
+  fixture-scrub:
+    # Every fixture in this public repo was written beside a private one. This
+    # is the gate that stops a borrowed name riding along on a paste.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Scrub fixtures for borrowed terms
+        run: ./scripts/fixture-scrub.sh
+
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Shellcheck
+        run: shellcheck scripts/*.sh
+
   test-mermaid-checker:
     runs-on: ubuntu-latest
     steps:

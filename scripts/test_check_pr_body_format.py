@@ -169,14 +169,14 @@ class TestMandatedSignatureFooter(unittest.TestCase):
         body = (
             "Some closing prose.\n"
             "\n"
-            "Linked: [PRI-1763](https://linear.app/prizmal/issue/PRI-1763/a-slug)\n"
+            "Linked: [ABC-1763](https://tracker.example.com/issue/ABC-1763/a-slug)\n"
             "— crimson-lemur-13\n"
         )
         self.assertEqual(_patterns(body), set())
 
     def test_signature_with_trailing_emoji_not_flagged(self):
         body = (
-            "Linked: [PRI-1834](https://linear.app/prizmal/issue/PRI-1834)\n"
+            "Linked: [ABC-1834](https://tracker.example.com/issue/ABC-1834)\n"
             "— cc-swift-viper-85 \U0001f916\n"
         )
         self.assertEqual(_patterns(body), set())
@@ -185,8 +185,8 @@ class TestMandatedSignatureFooter(unittest.TestCase):
         # An em-dash continuation that is NOT the handle footer is a genuine
         # mid-sentence wrap and must still be caught.
         body = (
-            "The router resolves the target per request\n"
-            "— which is why the signal has to precede it in the pipeline\n"
+            "The parser reads the schema's version from the header\n"
+            "— which is why the header has to arrive before the body\n"
         )
         self.assertIn("hard-newline-in-paragraph", _patterns(body))
 
@@ -318,7 +318,7 @@ class TestStructuralLinesThatLookLikeProse(unittest.TestCase):
     def test_bold_pseudo_heading_not_flagged(self):
         body = (
             "**Fail-open by design.**\n"
-            "the leg still proceeds when the reserve call times out.\n"
+            "the upload still proceeds when the lookup call times out.\n"
         )
         self.assertEqual(_patterns(body), set())
 
@@ -330,8 +330,8 @@ class TestStructuralLinesThatLookLikeProse(unittest.TestCase):
         # Bold at the START of a line that continues in plain text is an
         # ordinary paragraph, so a real wrap in it must still be caught.
         body = (
-            "**Fail-open by design** — the deliberate opposite of auth's\n"
-            "fail-closed posture, which matters on every billable leg.\n"
+            "**Fail-open by design** — the deliberate opposite of the\n"
+            "fail-closed posture the upload path takes.\n"
         )
         self.assertIn("hard-newline-in-paragraph", _patterns(body))
 

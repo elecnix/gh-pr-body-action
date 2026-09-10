@@ -22,38 +22,38 @@ import assert from 'node:assert/strict';
 const checker = await import('./check-pr-body-mermaid.mjs');
 const findBadMermaidBlocks = checker.findBadMermaidBlocks;
 
-// The incident diagram (PR1407_BAD) as it was merged — line 6 carries the
-// invalid shape `CB -. unclassified .->|"..."| SKIP[...]`: text between the
-// dotted-link dots AND a pipe label. mermaid 11.16.1 rejects it; GitHub renders
-// an error box.
-const PR1407_BAD = `flowchart LR
-    subgraph SW[Switch / core]
-        PL[credit plugin PreLLMHook]
-        CB[circuit breaker]
-        PL -->|"below-zero → 402 + ContextKeyCreditRejected"| CB
-        CB -. unclassified .->|"no store write, no report"| SKIP[request ends]
-        PX[provider returns 402] --> CB
-        CB -->|"billing exhaustion → open circuit + report"| RPT[exhaustion report → provider-key email]
+// A diagram that mermaid rejects — line 6 carries the invalid shape
+// `CB -. unclassified .->|"..."| SKIP[...]`: text between the dotted-link dots
+// AND a pipe label. mermaid 11.16.1 rejects it; GitHub renders an error box.
+// Every value here is invented; a fixture only has to be realistic markdown.
+const DOTTED_LINK_BAD = `flowchart LR
+    subgraph SW[upload service]
+        PL[intake handler]
+        CB[quota gate]
+        PL -->|"over limit → 429 + RetryAfter"| CB
+        CB -. unclassified .->|"no write, no report"| SKIP[request ends]
+        PX[upstream returns 429] --> CB
+        CB -->|"quota exhausted → open gate + report"| RPT[exhaustion notice → owner email]
     end
-    subgraph CA[config-api]
-        RS[ReserveCredit read] --> SNAP[balance snapshot]
-        SNAP --> L[creditLevelFor: how many thresholds crossed]
-        L -->|"crossing, not yet stamped"| ST[StampCreditThresholdNotify]
+    subgraph CA[quota service]
+        RS[Reserve read] --> SNAP[balance snapshot]
+        SNAP --> L[levelFor: how many thresholds crossed]
+        L -->|"crossing, not yet stamped"| ST[StampThresholdNotify]
         ST -->|"conditional, exactly one winner"| NS[notify seam]
-        NS -->|"KindCreditThreshold / KindCreditExhausted"| MAIL[tenant managers: '$X remaining']
+        NS -->|"KindThreshold / KindExhausted"| MAIL[account owners: '$X remaining']
     end
-    subgraph AD[admin]
-        B[GET /credit] --> BAL[$ left]
-        T[GET/PUT /credit/thresholds] --> FIELDS[two USD fields]
+    subgraph AD[console]
+        B[GET /balance] --> BAL[$ left]
+        T[GET/PUT /balance/thresholds] --> FIELDS[two USD fields]
     end
 `;
 
-// PR1407_FIXED: the incident diagram with the invalid link fixed — the
+// DOTTED_LINK_FIXED: the same diagram with the invalid link fixed — the
 // `. unclassified .` text dropped so the label carries it. This is the clean
-// pair for PR1407_BAD.
-const PR1407_FIXED = PR1407_BAD.replace(
-  'CB -. unclassified .->|"no store write, no report"| SKIP[request ends]',
-  'CB -.->|"no store write, no report"| SKIP[request ends]',
+// pair for DOTTED_LINK_BAD.
+const DOTTED_LINK_FIXED = DOTTED_LINK_BAD.replace(
+  'CB -. unclassified .->|"no write, no report"| SKIP[request ends]',
+  'CB -.->|"no write, no report"| SKIP[request ends]',
 );
 
 function wrapped(inner) {
@@ -75,8 +75,8 @@ test('dotted link with only a pipe label is valid', async () => {
   assert.deepEqual(await findBadMermaidBlocks(body), []);
 });
 
-test('PR #1407 diagram fails; its fix passes (the load-bearing pair)', async () => {
-  const badBody = wrapped(PR1407_BAD);
+test('the bad diagram fails; its fix passes (the load-bearing pair)', async () => {
+  const badBody = wrapped(DOTTED_LINK_BAD);
   const bad = await findBadMermaidBlocks(badBody);
   assert.equal(bad.length, 1);
   // start is the ```mermaid fence-open line (line 1 by construction); end is
@@ -85,7 +85,7 @@ test('PR #1407 diagram fails; its fix passes (the load-bearing pair)', async () 
   assert.equal(bad[0].end, badBody.split('\n').length - 1);
   assert.ok(bad[0].message.length > 0, 'message should carry the parse error');
 
-  const good = await findBadMermaidBlocks(wrapped(PR1407_FIXED));
+  const good = await findBadMermaidBlocks(wrapped(DOTTED_LINK_FIXED));
   assert.deepEqual(good, []);
 });
 
