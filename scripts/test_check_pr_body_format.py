@@ -42,6 +42,11 @@ def _patterns(body: str) -> set[str]:
     return {v.pattern for v in find_violations(body)}
 
 
+def _patterns_comment(body: str) -> set[str]:
+    """Patterns under comment mode, where the leading-reference arm is armed."""
+    return {v.pattern for v in find_violations(body, comment=True)}
+
+
 class TestParagraphHardBreak(unittest.TestCase):
     def test_clean_paragraphs_separated_by_blank_line(self):
         body = (
@@ -491,6 +496,193 @@ class TestWholeBodyIsAFileReference(unittest.TestCase):
         violations = find_violations("@/tmp/pr-body.md\n")
         self.assertEqual(len(violations), 1)
         self.assertEqual((violations[0].start, violations[0].end), (1, 1))
+
+
+class TestCommentModeFetchAndMain(unittest.TestCase):
+    """`--comment <id>` fetches one comment instead of the PR body.
+
+    Same REST approach as `--pr`: `GET /repos/{owner}/{repo}/issues/comments/{id}`
+    is one API call and no GraphQL, and the bot-author skip carries over because
+    agent comments use the same conventions as agent bodies.
+    """
+
+    def test_fetch_comment_hits_issues_comments_endpoint(self):
+        import io
+        import json as _json
+        from unittest import mock
+
+        payload = _json.dumps(
+            {"body": "a clean comment", "user": {"type": "User"}}
+        ).encode()
+        with mock.patch(
+            "urllib.request.urlopen", return_value=io.BytesIO(payload)
+        ) as urlopen:
+            body, is_bot = _CHECKER._fetch_comment("o/r", 4242, "tok-123")
+        self.assertEqual((body, is_bot), ("a clean comment", False))
+        (req,), kwargs = urlopen.call_args
+        self.assertEqual(
+            req.full_url, "https://api.github.com/repos/o/r/issues/comments/4242"
+        )
+        self.assertEqual(req.get_header("Authorization"), "Bearer tok-123")
+        self.assertIn("vnd.github+json", req.get_header("Accept"))
+
+    def test_fetch_comment_bot_author_detected(self):
+        import io
+        import json as _json
+        from unittest import mock
+
+        payload = _json.dumps(
+            {"body": "<html>generated</html>", "user": {"type": "Bot"}}
+        ).encode()
+        with mock.patch(
+            "urllib.request.urlopen", return_value=io.BytesIO(payload)
+        ):
+            body, is_bot = _CHECKER._fetch_comment("o/r", 4242, "tok")
+        self.assertTrue(is_bot)
+
+    def test_main_comment_mode_flags_violation(self):
+        calls = []
+
+        def fake_fetch_comment(repo, comment_id, token):
+            calls.append((repo, comment_id))
+            # A leading file reference above real content — the paste-instead-
+            # of-contents bug, which only fires in comment mode.
+            return ("@/tmp/cite-reply.md\n\nThe rest of the reply.\n", False)
+
+        original = _CHECKER._fetch_comment
+        _CHECKER._fetch_comment = fake_fetch_comment
+        try:
+            with unittest.mock.patch.dict(os.environ, {"GITHUB_TOKEN": "tok"}):
+                rc = _CHECKER.main(["--repo", "o/r", "--comment", "4242"])
+        finally:
+            _CHECKER._fetch_comment = original
+        self.assertEqual(rc, 1)
+        self.assertEqual(calls, [("o/r", 4242)])
+
+    def test_main_comment_mode_clean_body_returns_zero(self):
+        def fake_fetch_comment(repo, comment_id, token):
+            return ("A clean reply.\n\nWith a second paragraph.\n", False)
+
+        original = _CHECKER._fetch_comment
+        _CHECKER._fetch_comment = fake_fetch_comment
+        try:
+            with unittest.mock.patch.dict(os.environ, {"GITHUB_TOKEN": "tok"}):
+                rc = _CHECKER.main(["--repo", "o/r", "--comment", "1"])
+        finally:
+            _CHECKER._fetch_comment = original
+        self.assertEqual(rc, 0)
+
+    def test_main_comment_mode_bot_author_skipped(self):
+        calls = []
+
+        def fake_fetch_comment(repo, comment_id, token):
+            calls.append(comment_id)
+            return ("- item\ncontinuation at column zero\n", True)
+
+        original = _CHECKER._fetch_comment
+        _CHECKER._fetch_comment = fake_fetch_comment
+        try:
+            with unittest.mock.patch.dict(os.environ, {"GITHUB_TOKEN": "tok"}):
+                rc = _CHECKER.main(["--repo", "o/r", "--comment", "9"])
+        finally:
+            _CHECKER._fetch_comment = original
+        self.assertEqual(rc, 0)
+        self.assertEqual(calls, [9])
+
+    def test_main_comment_mutually_exclusive_with_pr(self):
+        with self.assertRaises(SystemExit) as cm:
+            _CHECKER.main(["--repo", "o/r", "--pr", "7", "--comment", "9"])
+        self.assertEqual(cm.exception.code, 2)
+
+    def test_main_comment_mutually_exclusive_with_body_file(self):
+        with self.assertRaises(SystemExit) as cm:
+            _CHECKER.main(["--body-file", "x", "--repo", "o/r", "--comment", "9"])
+        self.assertEqual(cm.exception.code, 2)
+
+    def test_main_comment_requires_repo(self):
+        with self.assertRaises(SystemExit) as cm:
+            _CHECKER.main(["--comment", "9"])
+        self.assertEqual(cm.exception.code, 2)
+
+    def test_main_comment_mode_missing_token_is_usage_failure(self):
+        from unittest import mock
+
+        env = {k: v for k, v in os.environ.items()}
+        env.pop("GITHUB_TOKEN", None)
+        env.pop("GH_TOKEN", None)
+        with mock.patch.dict(os.environ, env, clear=True):
+            rc = _CHECKER.main(["--repo", "o/r", "--comment", "9"])
+        self.assertEqual(rc, 2)
+
+    def test_main_comment_mode_failed_read_is_degraded_not_clean(self):
+        def fake_fetch_comment(repo, comment_id, token):
+            raise RuntimeError("boom")
+
+        original = _CHECKER._fetch_comment
+        _CHECKER._fetch_comment = fake_fetch_comment
+        try:
+            rc = _CHECKER.main(["--repo", "o/r", "--comment", "9"])
+        finally:
+            _CHECKER._fetch_comment = original
+        self.assertEqual(rc, 2)
+
+
+class TestFileReferenceOpensAComment(unittest.TestCase):
+    """In comment mode a leading `@<path>` token above real content is flagged.
+
+    The paste-instead-of-contents bug in a comment usually sits above the real
+    reply: an agent posts `@/tmp/cite-reply.md` and then the actual text under
+    it. The whole-body rule (correct for a PR description) never fires on that
+    shape, so comment mode widens it — while the whole-body behaviour for PR
+    bodies stays exactly as it was.
+    """
+
+    def test_comment_solely_the_reference_is_flagged(self):
+        body = "@/tmp/cite-reply.md\n"
+        self.assertIn("body-is-file-reference", _patterns_comment(body))
+
+    def test_comment_opens_with_reference_above_real_content(self):
+        body = "@/tmp/cite-reply.md\n\nHere is the actual reply text.\n"
+        self.assertIn("body-is-file-reference", _patterns_comment(body))
+
+    def test_comment_leading_reference_violation_spans_line_one(self):
+        violations = find_violations(
+            "@/tmp/cite-reply.md\n\nHere is the actual reply text.\n",
+            comment=True,
+        )
+        refs = [v for v in violations if v.pattern == "body-is-file-reference"]
+        self.assertEqual(len(refs), 1)
+        self.assertEqual((refs[0].start, refs[0].end), (1, 1))
+
+    def test_comment_leading_path_inside_prose_is_not_flagged(self):
+        # A legitimate comment can OPEN with a path token inside prose — the
+        # token followed by more words on the same line is ordinary content,
+        # not a paste accident. Only a line that is *solely* the token fires.
+        body = "@./build-notes.md explains why this gate exists.\n\nMore prose.\n"
+        self.assertEqual(_patterns_comment(body), set())
+
+    def test_comment_leading_mention_is_not_flagged(self):
+        # `@username` opens a reply constantly and is a mention, not a path.
+        body = "@reviewer thanks — the fix lands in the next push.\n"
+        self.assertEqual(_patterns_comment(body), set())
+
+    def test_comment_team_mention_line_not_flagged(self):
+        body = "@org/team could one of you sign off here?\n\nDetails below.\n"
+        self.assertEqual(_patterns_comment(body), set())
+
+    def test_comment_reference_in_the_middle_not_flagged(self):
+        # Only the OPENING line widens. A path token mid-comment sits inside
+        # real content and is ordinary prose.
+        body = "The reply below.\n\n@/tmp/cite-reply.md was the source.\n"
+        self.assertEqual(_patterns_comment(body), set())
+
+    def test_whole_body_default_mode_unchanged_by_widening(self):
+        # The load-bearing regression guard: the widening must not touch the
+        # whole-body behaviour a PR body relies on. A reference above real
+        # content stays clean in default mode; solely-the-reference stays red.
+        body = "@/tmp/pr-body.md\n\nReal content under it.\n"
+        self.assertEqual(_patterns(body), set())
+        self.assertIn("body-is-file-reference", _patterns("@/tmp/pr-body.md\n"))
 
 
 class TestFetchBodyUsesRestApiDirectly(unittest.TestCase):

@@ -484,14 +484,39 @@ def _find_collapsed_tables(lines: list[str]) -> list[Violation]:
     return out
 
 
-def _find_file_reference_body(body: str) -> list[Violation]:
-    """A body whose entire content is one `@<path>` token.
+def _find_file_reference_body(body: str, comment: bool = False) -> list[Violation]:
+    """A body that is, or in comment mode opens with, one `@<path>` token.
 
-    The reference renders as literal text — nothing expands it — so reviewers
-    open the PR and find no description at all. Only a body that is solely the
-    reference is flagged: a mention inside real prose is ordinary content.
+    The reference renders as literal text (nothing expands it), so reviewers
+    open the PR and find no description at all. In default mode only a body
+    that is solely the reference is flagged: a mention inside real prose is
+    ordinary content, and the paste accident for a PR description leaves the
+    body with nothing else in it.
+
+    In comment mode the rule widens: the same paste accident usually leaves the
+    reference as the OPENING line with the real reply under it, and that shape
+    is the bug the comment check exists for. A widened token fires when the
+    first non-blank line is solely the token; a token inside a prose line,
+    even the opening line, is ordinary content and stays clean.
     """
     stripped = body.strip()
+    if comment:
+        lines = stripped.split("\n")
+        # The widened arm: only a line that is *solely* the token, as the
+        # comment's opening line. A path token followed by prose on the same
+        # line is a legitimate sentence, not a paste accident. An empty
+        # (all-whitespace) comment splits to one empty line, which does not
+        # match the token, so it falls through to the empty return.
+        if _FILE_REFERENCE.match(lines[0]):
+            return [
+                Violation(
+                    pattern="body-is-file-reference",
+                    start=1,
+                    end=1,
+                    lines=(lines[0],),
+                )
+            ]
+        return []
     if "\n" in stripped or not _FILE_REFERENCE.match(stripped):
         return []
     return [
@@ -504,14 +529,19 @@ def _find_file_reference_body(body: str) -> list[Violation]:
     ]
 
 
-def find_violations(body: str) -> list[Violation]:
-    """All four formatting bugs in the PR body, in line order."""
+def find_violations(body: str, comment: bool = False) -> list[Violation]:
+    """All four formatting bugs in the PR body, in line order.
+
+    `comment=True` widens the file-reference rule to a leading token above
+    real content, which is where the paste-instead-of-contents bug lives in a
+    PR comment; the default-mode whole-body behaviour is unchanged.
+    """
     if not body:
         return []
     lines = body.split("\n")
     masked = _strip_masked(lines)
     violations: list[Violation] = []
-    violations.extend(_find_file_reference_body(body))
+    violations.extend(_find_file_reference_body(body, comment=comment))
     violations.extend(_find_paragraph_hard_breaks(masked))
     violations.extend(_find_list_item_hard_breaks(masked))
     violations.extend(_find_collapsed_tables(masked))
@@ -522,13 +552,31 @@ def find_violations(body: str) -> list[Violation]:
 def _fetch_body(repo: str, pr: int, token: str) -> tuple[str, bool]:
     """The PR body and whether a bot wrote it, in one REST read.
 
-    A direct HTTPS call to the REST API via urllib — no gh CLI required, so
+    A direct HTTPS call to the REST API via urllib, so no gh CLI is required:
     running the check needs nothing but a token in the environment. REST, not
     GraphQL: the repo's shared GraphQL budget is the scarce one. A failed read
     raises rather than returning an empty body, so it can never be mistaken
     for a PR with nothing wrong in it.
     """
     url = f"https://api.github.com/repos/{repo}/pulls/{pr}"
+    return _fetch_rest(repo, url, token)
+
+
+def _fetch_comment(repo: str, comment_id: int, token: str) -> tuple[str, bool]:
+    """One PR comment and whether a bot wrote it, in one REST read.
+
+    `GET /repos/{owner}/{repo}/issues/comments/{id}` is the issues-comments
+    endpoint, which serves PR comments too. Same REST approach as `_fetch_body`,
+    same bot-author skip, still one API call and still no GraphQL spend. A
+    comment on an `issue_comment` event lives in the base repo, so the event's
+    own token reads it and no additional scope work is needed.
+    """
+    url = f"https://api.github.com/repos/{repo}/issues/comments/{comment_id}"
+    return _fetch_rest(repo, url, token)
+
+
+def _fetch_rest(repo: str, url: str, token: str) -> tuple[str, bool]:
+    """The shared REST read behind the `--pr` and `--comment` modes."""
     request = urllib.request.Request(
         url,
         headers={
@@ -558,15 +606,29 @@ def main(argv: list[str] | None = None) -> int:
         help="PR number to fetch the body for (requires --repo)",
     )
     parser.add_argument(
+        "--comment",
+        type=int,
+        help="PR-comment id to fetch instead of the PR body (requires --repo; "
+        "mutually exclusive with --pr and --body-file)",
+    )
+    parser.add_argument(
         "--body-file",
         help="path to a file holding the PR body (use '-' for stdin)",
     )
     args = parser.parse_args(argv)
 
-    if args.body_file and (args.repo or args.pr):
-        parser.error("--body-file is mutually exclusive with --repo/--pr")
-    if not args.body_file and not (args.repo and args.pr):
-        parser.error("pass either --body-file or both --repo and --pr")
+    if args.body_file and (args.repo or args.pr or args.comment):
+        parser.error("--body-file is mutually exclusive with --repo/--pr/--comment")
+    if args.comment is not None and args.pr is not None:
+        parser.error("--comment is mutually exclusive with --pr")
+    if not args.body_file and not (
+        (args.repo and args.pr) or (args.repo and args.comment is not None)
+    ):
+        parser.error(
+            "pass either --body-file, or --repo with --pr, or --repo with --comment"
+        )
+
+    surface = "comment" if args.comment is not None else "PR body"
 
     try:
         if args.body_file:
@@ -585,7 +647,10 @@ def main(argv: list[str] | None = None) -> int:
                     file=sys.stderr,
                 )
                 return 2
-            body, is_bot = _fetch_body(args.repo, args.pr, token)
+            if args.comment is not None:
+                body, is_bot = _fetch_comment(args.repo, args.comment, token)
+            else:
+                body, is_bot = _fetch_body(args.repo, args.pr, token)
     except (urllib.error.URLError, OSError, RuntimeError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
@@ -593,13 +658,13 @@ def main(argv: list[str] | None = None) -> int:
     if is_bot:
         # A dependabot body is a several-hundred-line raw HTML changelog dump.
         # No human wrote it and no human will rewrite it.
-        print("skipped: PR body was written by a bot")
+        print(f"skipped: the {surface} was written by a bot")
         return 0
 
-    violations = find_violations(body)
+    violations = find_violations(body, comment=args.comment is not None)
     if not violations:
         if not body.strip():
-            print("no PR body to check (empty)")
+            print(f"no {surface} to check (empty)")
         else:
             print("no PR-body formatting violations")
         return 0
@@ -618,8 +683,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     if any(v.pattern == "body-is-file-reference" for v in violations):
         print(
-            "The body is a file reference (@path), not content — paste the"
-            " file's contents into the PR body instead of its path."
+            f"The {surface} is a file reference (@path), not content: paste the"
+            f" file's contents into the {surface} instead of its path."
         )
     return 1
 

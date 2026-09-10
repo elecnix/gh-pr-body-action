@@ -60,8 +60,35 @@ No `actions/checkout` is needed — the action reads the body via the GitHub API
 |---|---|---|
 | `repo` | `github.repository` | `OWNER/REPO` of the pull request |
 | `pr` | `github.event.pull_request.number` | pull-request number |
+| `comment` | `github.event.comment.id` | PR-comment id. When set, the format checker runs against that comment instead of the PR description (the mermaid checker has no comment mode and is skipped). Mutually exclusive with `pr`. |
 | `token` | `github.token` | token used to read the PR body (`pull-requests: read` suffices) |
 | `node-version` | `22` | Node major for the mermaid checker |
+
+### Checking PR comments too
+
+The same renderer rules apply to PR comments, and in comments the common failure is the paste accident. An agent posts the literal text `@/tmp/cite-reply.md` (the file reference) instead of the file's contents. In comment mode the `body-is-file-reference` rule also matches when the comment *opens* with one such token above real content; a path token inside a prose line, even the opening line, is ordinary content and is not reported.
+
+Wire it as a second job beside the body check. The `edited` type matters even more than for bodies: comments get fixed by editing, so the check re-runs and goes back green.
+
+```yaml
+on:
+  issue_comment:
+    types: [created, edited]
+
+jobs:
+  pr-comment-format:
+    # Keep repo issues out; this job is about PR comments only.
+    if: github.event.issue.pull_request != null
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: elecnix/gh-pr-body-action@v1
+        with:
+          comment: ${{ github.event.comment.id }}
+```
+
+Comment text is attacker-influenceable: anyone with read access can write it. The checker defangs `::` workflow commands when it echoes findings, and the job above is read-only and never gains write scopes. On the same calibration posture as the body check, this is advisory rather than required. The comment rule measured zero false positives over recent human-authored PR comments, but the corpus is thin (only a few multi-paragraph comments and one table), so the corpus must grow before the rule could be more than advisory.
 
 ### Outputs
 

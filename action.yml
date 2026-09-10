@@ -18,6 +18,14 @@ inputs:
     description: 'Pull-request number. Defaults to the number from the pull_request event.'
     required: false
     default: ${{ github.event.pull_request.number }}
+  comment:
+    description: >-
+      Pull-request comment id. When set, the format checker runs against that
+      comment instead of the PR description (the mermaid checker has no comment
+      mode and is skipped). Mutually exclusive with pr. Defaults to the comment
+      id from the issue_comment event.
+    required: false
+    default: ${{ github.event.comment.id }}
   token:
     description: 'GitHub token used to read the PR body. Needs pull-requests: read at minimum.'
     required: false
@@ -56,10 +64,11 @@ runs:
         GITHUB_TOKEN: ${{ inputs.token }}
         PR_REPO: ${{ inputs.repo }}
         PR_NUMBER: ${{ inputs.pr }}
+        COMMENT_ID: ${{ inputs.comment }}
         ACTION_DIR: ${{ github.action_path }}
       run: |
-        if [ -z "$PR_NUMBER" ]; then
-          echo "::notice::No pull-request number available (not a pull_request event); skipping."
+        if [ -z "$PR_NUMBER" ] && [ -z "$COMMENT_ID" ]; then
+          echo "::notice::No pull-request number or comment id available (not a pull_request or issue_comment event); skipping."
           echo "rc=0" >> "$GITHUB_OUTPUT"
           exit 0
         fi
@@ -68,6 +77,18 @@ runs:
         # paragraph AND a bad diagram sees both findings in one run. errexit is
         # on by default, so capture each rc with it off.
         set +e
+        if [ -n "$COMMENT_ID" ]; then
+          # Comment mode: one comment, one REST fetch, and the mermaid checker
+          # does not apply to it. Comment text is attacker-influenceable, so
+          # the job stays read-only and never gains write scopes; the checker
+          # defangs `::` workflow commands when it echoes findings.
+          python3 "$ACTION_DIR/scripts/check-pr-body-format.py" \
+            --repo "$PR_REPO" --comment "$COMMENT_ID"
+          rc1=$?
+          echo "rc=$rc1" >> "$GITHUB_OUTPUT"
+          set -e
+          exit "$rc1"
+        fi
         python3 "$ACTION_DIR/scripts/check-pr-body-format.py" \
           --repo "$PR_REPO" --pr "$PR_NUMBER"
         rc1=$?
