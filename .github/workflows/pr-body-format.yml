@@ -19,4 +19,9 @@ jobs:
   pr-body-format:
     runs-on: ubuntu-latest
     steps:
+      # This repo ships no .vale.ini, so the prose step reports "skipped, no
+      # rules found" here — which is the behaviour worth dogfooding. The
+      # checkout is what lets it look at all; without one the step could not
+      # tell "no rules" from "no checkout".
+      - uses: actions/checkout@v5
       - uses: elecnix/gh-pr-body-action@v1

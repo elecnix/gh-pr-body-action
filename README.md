@@ -52,7 +52,15 @@ jobs:
       - uses: elecnix/gh-pr-body-action@v1
 ```
 
-No `actions/checkout` is needed — the action reads the body via the GitHub API.
+The body itself is read via the GitHub API, so the two rendering checks need no `actions/checkout`. The prose check does — it reads your rules out of the checkout. Add `actions/checkout` before the action to turn it on:
+
+```yaml
+    steps:
+      - uses: actions/checkout@v5
+      - uses: elecnix/gh-pr-body-action@v1
+```
+
+Without it the prose step reports "skipped, no rules found" and the job stays green.
 
 ### Inputs
 
@@ -63,6 +71,47 @@ No `actions/checkout` is needed — the action reads the body via the GitHub API
 | `comment` | `github.event.comment.id` | PR-comment id. When set, the format checker runs against that comment instead of the PR description (the mermaid checker has no comment mode and is skipped). Mutually exclusive with `pr`. |
 | `token` | `github.token` | token used to read the PR body (`pull-requests: read` suffices) |
 | `node-version` | `22` | Node major for the mermaid checker |
+| `prose` | `true` | lint the description against your repo's own prose rules. Set to `false` to turn the step off. |
+| `prose-fail` | `false` | whether a prose finding fails the job. See [Prose](#prose-your-rules-not-ours). |
+| `prose-rules-dir` | `github.workspace` | directory holding your `.vale.ini` |
+| `vale-version` | `3.20.0` | vale release used by the prose step |
+
+## Prose: your rules, not ours
+
+The action also lints the description as prose — on by default. **It ships no rules.** It reads a `.vale.ini` out of your checkout and runs [vale](https://vale.sh) with it. A repo that has no `.vale.ini` is skipped, out loud, with the reason printed:
+
+```
+prose: skipped. No prose rules found at /home/runner/work/repo/repo/.vale.ini.
+       This check carries no rules of its own; it reads the ones the
+       repository ships. Add a .vale.ini (and run actions/checkout
+       before this step) to turn it on.
+```
+
+That is the point. A prose standard belongs to the project that wrote it. A linter that shipped its own would be enforcing a stranger's taste on every caller, and a linter that stayed quiet about having no rules would hand you a green check that means nothing.
+
+**It reports; it does not block.** `prose-fail` is `false` by default, so a finding annotates the run and the job stays green. Turn it on once your rules have earned it:
+
+```yaml
+      - uses: elecnix/gh-pr-body-action@v1
+        with:
+          prose-fail: 'true'    # a prose finding now fails the job
+```
+
+One case ignores that setting: if the linter could not run at all — vale missing, `vale sync` unable to fetch the packages your config pins — the job fails whatever `prose-fail` says. A check that did not start has not passed.
+
+Run the same check by hand on a body before you send it:
+
+```bash
+python3 scripts/check-pr-body-prose.py --body-file body.md --rules-dir .
+```
+
+### Two ways this check could have lied
+
+Both are the same shape — a run that finds nothing because it could never have found anything — and both are covered by a test.
+
+**Vale picks its parser from the file extension.** A body written to a bare path, to a `.txt`, or piped on stdin lints as *plain text*: every markdown-scoped rule is skipped, nothing says so, and the run reports clean. The checker therefore always copies the body to a temporary `pr-body.md` before vale sees it, whatever the source was.
+
+**Vale exits 0 on a warning.** Only an `error`-level alert makes it exit non-zero, so a rule pack written at `warning` — most of them — reports every finding and still returns success. The checker reads the verdict from vale's JSON output and uses the exit status only to tell "found alerts" apart from "could not run".
 
 ### Checking PR comments too
 

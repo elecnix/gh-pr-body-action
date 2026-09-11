@@ -30,8 +30,8 @@ Three shapes are flagged:
      and continues on the next line. This is the common one: a whole body
      hard-wrapped at a column limit.
 
-         Bad:   The router resolves the target per request, which is
-                why the signal has to precede it.
+         Bad:   The parser reads the schema's version from the header,
+                which is why the header has to arrive first.
          Renders as two lines with a `<br>` between them.
          Fix:   let the line run long; the browser wraps it.
 
@@ -40,9 +40,9 @@ Three shapes are flagged:
      bullet, so the text is not lost; comment mode simply hard-breaks it, and
      the item renders as two ragged lines instead of one flowing line.
 
-         Bad:   - the reserve id is minted per billable leg
-                and stashed for the settle worker
-         Renders as: <li>…billable leg<br>and stashed…</li>
+         Bad:   - the batch id is minted once per upload
+                and stashed for the retry worker
+         Renders as: <li>…per upload<br>and stashed…</li>
          Fix:   indent the continuation by two spaces.
 
   3. **Collapsed table** — header, separator, and data rows pipe-joined onto one
@@ -125,14 +125,14 @@ it still flags 11 of the 94 human-authored bodies, all of them already merged.
 Making it required would redden the trunk for bodies nobody is going to rewrite.
 
 Advisory here means the check goes **red** without blocking the merge — not that
-it may be skipped. The `/pr` skill's rule is that every advisory finding gets
+it may be skipped. The source repo's rule is that every advisory finding gets
 read and then either acted on (fixed here, or filed as a follow-up) or dismissed
 with a stated reason. Nothing mechanically enforces that, so the honest claim is
 "must be read", not "blocks the merge".
 
 Usage — CI reads the PR body from the GitHub API:
 
-    python3 scripts/check-pr-body-format.py --repo PrizmalAi/PrizmalSwitch --pr 1234
+    python3 scripts/check-pr-body-format.py --repo OWNER/REPO --pr 1234
 
 Local repro against a saved body (deterministic, no network):
 
