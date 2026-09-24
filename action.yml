@@ -33,7 +33,7 @@ inputs:
   node-version:
     description: 'Node.js major version used to run the mermaid checker.'
     required: false
-    default: '22'
+    default: '24'
   prose:
     description: >-
       Lint the description against the calling repository's own prose rules
