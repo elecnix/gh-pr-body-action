@@ -79,7 +79,7 @@ Without it the prose step reports "skipped, no rules found" and the job stays gr
 |---|---|---|
 | `repo` | `github.repository` | `OWNER/REPO` of the pull request |
 | `pr` | `github.event.pull_request.number` | pull-request number |
-| `comment` | `github.event.comment.id` | PR-comment id. When set, the format checker runs against that comment instead of the PR description (the mermaid checker has no comment mode and is skipped). Mutually exclusive with `pr`. |
+| `comment` | `github.event.comment.id` | PR-comment id. When set, the format checker runs against that comment instead of the PR description (the mermaid checker has no comment mode and is skipped, and so is the prose check, which lints a description). Wiring both `comment` and `pr` is an error. |
 | `token` | `github.token` | token used to read the PR body (`pull-requests: read` suffices) |
 | `node-version` | `22` | Node major for the mermaid checker |
 | `prose` | `true` | lint the description against your repo's own prose rules. Set to `false` to turn the step off. |
@@ -154,9 +154,14 @@ Comment text is attacker-influenceable: anyone with read access can write it. Ev
 
 | Output | Description |
 |---|---|
-| `violations` | combined exit code: `0` clean, `1` violation(s), `2` usage or read failure |
+| `violations` | combined exit code of the format and mermaid checkers: `0` clean, `1` violation(s), `2` usage or read failure |
+| `prose` | the prose checker's own exit code: `0` clean or skipped, `1` finding, `2` could not run |
 
 Exit codes: `0` — no findings, empty body, or bot author. `1` — at least one finding, each printed with its pattern name, its line span, and its evidence: the offending line for the format checker, the parser's own reason for the mermaid checker, the caller's vale check name for the prose one. `2` — the body could not be read; a failed read is never reported as a clean body.
+
+The three numbers are not the same number on purpose. `violations` is the formatting verdict; `prose` is the prose verdict; the step's own conclusion is the two escalated together, so a repo with `prose-fail: 'true'` and a prose finding but a well-formed body gets a red step and a `violations` of `0`. Read the output you meant, not the step.
+
+`violations` can report `2`. It could not before: the action combined its two checker codes with `rc=$(( rc1 || rc2 ))`, and arithmetic `||` is a boolean operator that yields `0` or `1` and nothing else, so every read failure was published to the caller as an ordinary formatting violation. The wiring now keeps the more severe code — `2` outranks `1`, `1` outranks `0`.
 
 ## Advisory, on purpose
 
@@ -182,8 +187,12 @@ Unit tests:
 
 ```
 python3 scripts/test_check_pr_body_format.py
+python3 scripts/test_check_pr_body_prose.py
+python3 scripts/test_check_pr_body_orchestrator.py
 cd scripts && npm test
 ```
+
+The orchestrator ([`scripts/check-pr-body-orchestrator.py`](scripts/check-pr-body-orchestrator.py)) is the whole ladder the action runs: which surface to check, which checkers to run and in what order, how their exit codes combine, and what a prose finding is worth. It lives in a script rather than in `action.yml` because all four are rules, and a rule inside a `run:` block has no test file and no CI job. Its docstring states each rule; `scripts/test_check_pr_body_orchestrator.py` pins them.
 
 ## Provenance
 
