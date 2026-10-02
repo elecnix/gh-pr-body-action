@@ -18,8 +18,11 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { join } from 'node:path';
 
 const checker = await import('./check-pr-body-mermaid.mjs');
+const finding = await import('./finding.mjs');
+const { Finding, MAX_ECHOED_LINES, MAX_REPORTED, defang, renderReport } = finding;
 const findBadMermaidBlocks = checker.findBadMermaidBlocks;
 
 // A diagram that mermaid rejects — line 6 carries the invalid shape
@@ -231,6 +234,140 @@ test('_fetchBody raises on a failed read, never returns a clean body', async () 
   } finally {
     globalThis.fetch = originalFetch;
   }
+});
+
+// -------------------------------------------------- the finding seam
+
+test('the findings are real identifiers, and both are distinct', async () => {
+  const body = [
+    '```mermaid',
+    'flowchart LR',
+    'A -. t .->|x| B',
+    '```',
+    '',
+    '```mermaid',
+    'flowchart LR',
+    'C --> D',
+  ].join('\n');
+  const bad = await findBadMermaidBlocks(body);
+  assert.deepEqual(bad.map((b) => b.pattern), [
+    'unparsable-mermaid',
+    'unclosed-mermaid-fence',
+  ]);
+  // The unclosed fence is its own identifier because it is a different defect
+  // with a different fix: mermaid never rejects it, nothing parses it at all.
+  assert.equal(bad[0].span, 'lines 1–4');
+  assert.equal(bad[1].span, 'lines 6–8');
+});
+
+test('the checker is still async, because it awaits the real parser', () => {
+  // The seam must not have forced a synchronous interface.
+  const pending = findBadMermaidBlocks('```mermaid\nflowchart LR\nA --> B\n```\n');
+  assert.ok(pending instanceof Promise);
+  return pending.then((bad) => assert.deepEqual(bad, []));
+});
+
+test('defang is an exact, visible, ASCII substitution', () => {
+  assert.equal(defang('::error::boom'), "'::error::boom");
+  assert.equal(defang('   ::stop-commands::tok'), "   '::stop-commands::tok");
+  assert.equal(defang('a normal line'), 'a normal line');
+  // A mid-line `::` can never be a workflow command, and rewriting it would
+  // corrupt evidence for nothing.
+  assert.equal(defang('see foo::bar'), 'see foo::bar');
+  // The rejected mechanism was a zero-width space: invisible in a CI log, not
+  // greppable, and invisible in a diff. Whatever else changes, the substitution
+  // must stay printable.
+  assert.match(defang('::error::boom'), /^[\x20-\x7e]*$/);
+});
+
+test('a rendered finding is the pattern, the span, and the parser reason', () => {
+  const rendered = new Finding('unparsable-mermaid', 3, 11, {
+    message: "Expecting 'AMP', 'COLON', got 'PIPE'",
+  }).render();
+  assert.equal(
+    rendered,
+    "unparsable-mermaid (lines 3–11)\n    Expecting 'AMP', 'COLON', got 'PIPE'",
+  );
+});
+
+test('a rendered finding defangs a message that would have run', () => {
+  // mermaid's own reason is never author-supplied verbatim, so this shape is
+  // hypothetical — but the guard has to be correct if a future parser ever
+  // leads its message with `::`, and the indent cannot be relied on because the
+  // runner strips it.
+  const finding = new Finding('unparsable-mermaid', 1, 1, {
+    message: '::error::a command the parser could have echoed',
+  });
+  assert.equal(
+    finding.render(),
+    "unparsable-mermaid (line 1)\n    '::error::a command the parser could have echoed",
+  );
+  for (const line of finding.render().split('\n')) {
+    assert.ok(!line.trimStart().startsWith('::'));
+  }
+});
+
+test('the echo cap summarises the rest of a finding by count', () => {
+  const lines = Array.from({ length: 7 }, (_, n) => `diagram line number ${n}`);
+  const rendered = new Finding('unparsable-mermaid', 1, 7, { lines }).render();
+  assert.equal(
+    rendered,
+    [
+      'unparsable-mermaid (lines 1–7)',
+      ...lines.slice(0, MAX_ECHOED_LINES).map((l) => `    ${l}`),
+      `    … 3 more line(s) in the same run`,
+    ].join('\n'),
+  );
+});
+
+test('the report cap summarises the rest of a run by count', () => {
+  const many = Array.from({ length: MAX_REPORTED + 4 }, (_, n) =>
+    new Finding('unparsable-mermaid', n + 1, n + 1, { message: `reason ${n}` }));
+  const printed = renderReport(many, `${many.length} unparsable mermaid diagram(s) found:`, ['', 'Fix it.']);
+  assert.equal(
+    printed,
+    [
+      `${many.length} unparsable mermaid diagram(s) found:`,
+      ...many.slice(0, MAX_REPORTED).flatMap((f) => ['', f.render()]),
+      '',
+      `… and 4 more, same patterns.`,
+      '',
+      'Fix it.',
+    ].join('\n'),
+  );
+});
+
+test('the mermaid CLI prints the shared shape, and exits 1', async () => {
+  const { mkdtempSync, writeFileSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const path = join(mkdtempSync(join(tmpdir(), 'mermaid-body-')), 'body.md');
+  writeFileSync(
+    path,
+    ['Intro.', '', '```mermaid', 'flowchart LR', 'A -. t .->|x| B', '```', ''].join('\n'),
+  );
+  const printed = [];
+  const originalLog = console.log;
+  console.log = (...args) => printed.push(args.join(' '));
+  let rc;
+  try {
+    rc = await checker.main(['--body-file', path]);
+  } finally {
+    console.log = originalLog;
+  }
+  assert.equal(rc, 1);
+  assert.equal(
+    printed.join('\n'),
+    [
+      '1 unparsable mermaid diagram(s) found:',
+      '',
+      "unparsable-mermaid (lines 3–6)",
+      "    Expecting 'AMP', 'COLON', 'DOWN', 'DEFAULT', 'NUM', 'COMMA',"
+        + " 'NODE_STRING', 'BRKT', 'MINUS', 'MULT', 'UNICODE_TEXT', got 'PIPE'",
+      '',
+      'Fix by making the diagram parse: run it through the mermaid live editor,'
+        + " or drop text between a dotted link's dots and fold it into the label.",
+    ].join('\n'),
+  );
 });
 
 // ------------------------------------------- parity with the Python seam

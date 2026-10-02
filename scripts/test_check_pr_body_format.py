@@ -15,33 +15,39 @@ own docstring.
 from __future__ import annotations
 
 import importlib.util
+import io
 import os
 import sys
+import tempfile
 import unittest
 import unittest.mock
+from contextlib import redirect_stdout
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _SCRIPT = os.path.join(_HERE, "check-pr-body-format.py")
 _SEAM = os.path.join(_HERE, "pr_body_source.py")
 
 
-def _load():
-    spec = importlib.util.spec_from_file_location("check_pr_body_format", _SCRIPT)
+def _load(path, name):
+    spec = importlib.util.spec_from_file_location(name, path)
     assert spec and spec.loader
     mod = importlib.util.module_from_spec(spec)
-    sys.modules["check_pr_body_format"] = mod
+    sys.modules[name] = mod
     spec.loader.exec_module(mod)
     return mod
 
 
-_CHECKER = _load()
+_CHECKER = _load(_SCRIPT, "check_pr_body_format")
+# The shared seam both Python checkers report through. Loaded here as well as by
+# the checker, so these tests pin the seam itself rather than a re-export.
+_FINDING = _load(os.path.join(_HERE, "finding.py"), "finding")
 find_violations = _CHECKER.find_violations
-Violation = _CHECKER.Violation
 # The acquisition seam. The checker delegates every read to it, so these tests
 # replace the seam's entry points — which is also the proof that the checker
 # itself fetches nothing: a test that had to fake a socket to exercise `main`
 # would be testing the wrong layer.
 pr_body_source = _CHECKER.pr_body_source
+Finding = _CHECKER.Finding
 
 
 def _patterns(body: str) -> set[str]:
@@ -383,7 +389,7 @@ class TestRunsCollapseIntoOneViolation(unittest.TestCase):
         self.assertIn("more line(s) in the same run", rendered)
         # Head line + the echo cap + the summary line.
         self.assertLessEqual(
-            len(rendered.splitlines()), _CHECKER._MAX_ECHOED_LINES + 2
+            len(rendered.splitlines()), _FINDING.MAX_ECHOED_LINES + 2
         )
 
 
@@ -396,24 +402,109 @@ class TestWorkflowCommandInjection(unittest.TestCase):
     """
 
     def test_leading_workflow_command_is_defanged(self):
-        self.assertEqual(_CHECKER._defang("::error::boom"), "'::error::boom")
+        self.assertEqual(_FINDING.defang("::error::boom"), "'::error::boom")
 
     def test_indented_workflow_command_is_defanged(self):
         self.assertEqual(
-            _CHECKER._defang("   ::stop-commands::tok"), "   '::stop-commands::tok"
+            _FINDING.defang("   ::stop-commands::tok"), "   '::stop-commands::tok"
         )
 
     def test_ordinary_line_is_untouched(self):
-        self.assertEqual(_CHECKER._defang("a normal line"), "a normal line")
+        self.assertEqual(_FINDING.defang("a normal line"), "a normal line")
 
     def test_mid_line_colons_are_untouched(self):
-        self.assertEqual(_CHECKER._defang("see foo::bar"), "see foo::bar")
+        self.assertEqual(_FINDING.defang("see foo::bar"), "see foo::bar")
+
+    def test_the_defang_is_visible_and_leaves_no_invisible_characters(self):
+        # The rejected mechanism was a zero-width space: it reads as unmodified
+        # in a CI log, cannot be grepped, and is invisible in a source diff — so
+        # a formatter stripping stray unicode would silently disarm it. The
+        # substitution that won is ASCII, so the neutralised form is greppable.
+        defanged = _FINDING.defang("::error::boom")
+        self.assertTrue(defanged.isascii(), repr(defanged))
+        self.assertEqual(defanged, "'::error::boom")
 
     def test_rendered_violation_never_starts_a_command(self):
         body = "::error::this line wraps\nand continues down here\n"
-        for violation in find_violations(body):
-            for line in violation.render().splitlines():
+        for finding in find_violations(body):
+            for line in finding.render().splitlines():
                 self.assertFalse(line.lstrip().startswith("::"))
+
+    def test_the_whole_render_is_exact(self):
+        body = "::error::this line wraps\nand continues down here\n"
+        self.assertEqual(
+            find_violations(body)[0].render(),
+            "hard-newline-in-paragraph (lines 1–2)\n"
+            "    '::error::this line wraps\n"
+            "    and continues down here",
+        )
+
+
+class TestFindingSeam(unittest.TestCase):
+    """The one shape both Python checkers report through.
+
+    Each assertion is on the exact rendered string. The seam is what makes the
+    defang structural rather than incidental — nothing reaches stdout except
+    through `Finding.render()` — so the render, not the substitution call, is
+    the thing worth pinning.
+    """
+
+    def test_pattern_and_span(self):
+        item = find_violations(
+            "- list item that wraps\nand continues at column zero\n"
+        )[0]
+        self.assertEqual(item.pattern, "hard-newline-in-list-item")
+        self.assertEqual(item.start, 1)
+        self.assertEqual(item.end, 2)
+        self.assertEqual(item.span, "lines 1–2")
+
+    def test_a_single_line_finding_says_line_not_lines(self):
+        one = find_violations("@/tmp/pr-body.md")[0]
+        self.assertEqual(one.pattern, "body-is-file-reference")
+        self.assertEqual(one.span, "line 1")
+        self.assertEqual(
+            one.render(),
+            "body-is-file-reference (line 1)\n    @/tmp/pr-body.md",
+        )
+
+    def test_the_echo_cap_renders_the_exact_block(self):
+        body = "".join(f"wrapped line number {n} continuing on\n" for n in range(7))
+        self.assertEqual(
+            find_violations(body)[0].render(),
+            "hard-newline-in-paragraph (lines 1–7)\n"
+            "    wrapped line number 0 continuing on\n"
+            "    wrapped line number 1 continuing on\n"
+            "    wrapped line number 2 continuing on\n"
+            "    wrapped line number 3 continuing on\n"
+            "    … 3 more line(s) in the same run",
+        )
+
+    def test_the_report_cap_summarises_the_rest_by_count(self):
+        total = _FINDING.MAX_REPORTED + 5
+        # One collapsed table per line: each is its own finding, so the count is
+        # exact and no other pattern competes for the cap.
+        body = "".join(
+            f"| g{n} | r{n} | --- | --- | a{n} | b{n} |\n" for n in range(total)
+        )
+        with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False) as handle:
+            handle.write(body)
+            path = handle.name
+        try:
+            buffer = io.StringIO()
+            with redirect_stdout(buffer):
+                rc = _CHECKER.main(["--body-file", path])
+        finally:
+            os.unlink(path)
+
+        printed = buffer.getvalue()
+        self.assertEqual(rc, 1)
+        self.assertIn(f"{total} PR-body formatting violation(s) found:", printed)
+        self.assertIn("collapsed-table (line 1)", printed)
+        self.assertIn("… and 5 more, same patterns.", printed)
+        # The cap is a summary, not a silent truncation: the header still counts
+        # them all, and only the per-finding blocks are capped.
+        self.assertEqual(printed.count("collapsed-table ("), _FINDING.MAX_REPORTED)
+        self.assertIn("Fix by separating paragraphs", printed)
 
 
 class TestHtmlCommentMasking(unittest.TestCase):

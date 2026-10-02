@@ -59,6 +59,11 @@ Exit codes:
 
 A caller that gates on this must treat 2 as a failure. A linter that could not
 start has not passed.
+
+Each alert is reported as a Finding — the same shape the other two checkers
+emit, defined in scripts/finding.py — whose pattern is the vale check name.
+That name belongs to the calling repository, which is the whole point of this
+checker, so no fixed identifier for it is listed in this repo's README.
 """
 
 from __future__ import annotations
@@ -85,6 +90,17 @@ if _SCRIPT_DIR not in sys.path:
 
 import pr_body_source  # noqa: E402  (needs the path above)
 
+# scripts/finding.py sits beside this script. action.yml runs this file by
+# absolute path from an arbitrary working directory, and the unit tests load it
+# by file location, so the import path is derived from __file__ rather than
+# assumed.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+
+# pylint: disable=wrong-import-position
+from finding import Finding, render_report
+
 # The name the body is copied to. The extension is the whole point; see above.
 _BODY_FILENAME = "pr-body.md"
 
@@ -94,19 +110,11 @@ _BODY_FILENAME = "pr-body.md"
 # extension trap, so it gets the same treatment: sync, or refuse to report.
 _PACKAGES = re.compile(r"^\s*Packages\s*=", re.MULTILINE)
 
-# `::error` and friends are workflow commands. A PR body is author-controlled,
-# so its text is defanged before it can be echoed into a runner's log.
-_WORKFLOW_COMMAND = re.compile(r"^(\s*)::")
-
 # One sentence, two callers. `lint()` owns the guard — it is the seam that
 # promises status 2 for "vale could not run" — and `main()` repeats it only so a
 # missing vale costs no body read (and, with --repo/--pr, no network round trip).
 # A linter that could not start has not passed, and both paths say the same.
 _VALE_MISSING = "vale is not installed, so no verdict is safe."
-
-
-def _defang(line: str) -> str:
-    return _WORKFLOW_COMMAND.sub(r"\1:​:", line)
 
 
 def find_config(rules_dir: str, explicit: str | None) -> str | None:
@@ -126,8 +134,10 @@ def _sync(config: str, rules_dir: str) -> None:
     )
 
 
-def lint(body: str, config: str, rules_dir: str, sync: bool = True) -> tuple[int, str]:
-    """Lint `body` as markdown. Returns a status and a human-readable report.
+def lint(
+    body: str, config: str, rules_dir: str, sync: bool = True
+) -> tuple[int, list[Finding], str]:
+    """Lint `body` as markdown. Returns a status, the findings, and a detail.
 
     Status 0 clean, 1 alerts, 2 vale could not run. The alert count comes from
     vale's JSON, never from its exit code — see the module docstring on warnings.
@@ -135,16 +145,21 @@ def lint(body: str, config: str, rules_dir: str, sync: bool = True) -> tuple[int
     Status 2 is this function's own promise, so the guard that keeps it belongs
     here and not in the caller: with vale off PATH this returns 2 rather than
     letting FileNotFoundError escape.
+
+    The findings list is empty on 0 and 1; the detail string carries the reason
+    on 2 and is empty otherwise. The detail is deliberately not a Finding: a
+    linter that could not start has found nothing, and reporting "no findings"
+    for that is the lie this checker exists to avoid.
     """
     if shutil.which("vale") is None:
-        return 2, _VALE_MISSING
+        return 2, [], _VALE_MISSING
 
     if sync and _PACKAGES.search(_read_text(config)):
         try:
             _sync(config, rules_dir)
         except (subprocess.CalledProcessError, OSError) as exc:
             detail = getattr(exc, "stderr", "") or str(exc)
-            return 2, f"vale sync failed, so the pinned rules are missing:\n{detail}"
+            return 2, [], f"vale sync failed, so the pinned rules are missing:\n{detail}"
 
     with tempfile.TemporaryDirectory() as tmp:
         # The copy is what closes the extension trap. Never lint the caller's
@@ -165,24 +180,43 @@ def lint(body: str, config: str, rules_dir: str, sync: bool = True) -> tuple[int
         report = json.loads(result.stdout or "{}")
     except json.JSONDecodeError:
         detail = (result.stderr or result.stdout).strip()
-        return 2, f"vale did not return a report:\n{detail}"
+        return 2, [], f"vale did not return a report:\n{detail}"
 
     alerts = [alert for alerts in report.values() for alert in alerts]
     if not alerts:
         # An empty report from a run that also failed is "could not run", not
         # "clean". Only trust the emptiness when vale was otherwise happy.
         if result.returncode > 1:
-            return 2, (result.stderr or result.stdout).strip()
-        return 0, ""
-    return 1, "\n".join(_render(alert) for alert in alerts)
+            return 2, [], (result.stderr or result.stdout).strip()
+        return 0, [], ""
+    return 1, [_finding(alert) for alert in alerts], ""
 
 
-def _render(alert: dict) -> str:
-    """One alert, in the shape an editor and a human both read."""
-    return (
-        f"PR body:{alert.get('Line', 0)}:{alert.get('Span', [0])[0]}: "
-        f"{alert.get('Severity', 'alert')}: {alert.get('Check', '?')}: "
-        f"{alert.get('Message', '')}"
+def _finding(alert: dict) -> Finding:
+    """One vale alert as a Finding: the check name is the pattern.
+
+    The pattern belongs to the calling repository's own rule pack, which is why
+    this checker's findings cannot be named in this repo's README the way the
+    four format patterns are. Everything else is the shared shape: the line vale
+    reported, and the severity and message in the renderer's own words.
+
+    The column span stays in the message rather than the head, because the head
+    is the same for every checker and the column is the one thing here an editor
+    needs. vale reports it as a pair — `[first, last]` — and most alerts are one
+    character wide, so both spellings are kept.
+    """
+    span = alert.get("Span") or [0]
+    first, last = int(span[0]), int(span[-1])
+    columns = f"column {first}" if first == last else f"columns {first}–{last}"
+    line = int(alert.get("Line", 0) or 0)
+    return Finding(
+        pattern=alert.get("Check", "?"),
+        start=line,
+        end=line,
+        message=(
+            f"{columns}: {alert.get('Severity', 'alert')}: "
+            f"{alert.get('Message', '')}"
+        ),
     )
 
 
@@ -255,16 +289,17 @@ def main(argv: list[str] | None = None) -> int:
         print("prose: the body is empty, so there is nothing to lint.")
         return 0
 
-    status, output = lint(body, config, args.rules_dir, sync=not args.no_sync)
+    status, findings, detail = lint(body, config, args.rules_dir, sync=not args.no_sync)
     if status > 1:
-        print(f"prose: vale could not run, so no verdict is safe.\n{output}", file=sys.stderr)
+        print(f"prose: vale could not run, so no verdict is safe.\n{detail}", file=sys.stderr)
         return 2
     if status == 0:
         print("prose: clean against this repository's rules.")
         return 0
 
     print("prose: the description does not match this repository's rules.\n")
-    print("\n".join(_defang(line) for line in output.splitlines()))
+    print(render_report(findings, f"{len(findings)} prose finding(s):"))
+
     print(
         "\nThe rules are this repository's own, in .vale.ini. Reproduce locally:\n"
         "    vale --no-global --config .vale.ini <a copy of the body named *.md>"
