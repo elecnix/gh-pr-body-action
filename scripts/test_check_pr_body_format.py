@@ -17,6 +17,7 @@ from __future__ import annotations
 import importlib.util
 import io
 import os
+import re
 import sys
 import tempfile
 import unittest
@@ -350,6 +351,117 @@ class TestStructuralLinesThatLookLikeProse(unittest.TestCase):
     def test_placeholder_dashes_not_flagged(self):
         body = "Run it with the flag\n--force-with-lease is required.\n"
         self.assertEqual(_patterns(body), set())
+
+
+class TestSuppressionRegistry(unittest.TestCase):
+    """The seven suppressions as data, so a claim can go stale visibly.
+
+    The module docstring argues each one and the classes above pin each one in
+    prose. Neither can notice itself drifting: a rationale can go on describing
+    a regex that has since been deleted, and the calibration census — four
+    measured, three latent — is a claim about a corpus no code holds. This
+    class reads the registry instead of the prose, which is the only form of the
+    claim that a later change can contradict.
+    """
+
+    def setUp(self):
+        self.entries = _CHECKER.SUPPRESSIONS
+
+    def test_seven_suppressions_are_registered_with_a_reason(self):
+        self.assertEqual(len(self.entries), 7)
+        names = [e.name for e in self.entries]
+        self.assertEqual(len(set(names)), len(names), "duplicate name")
+        for entry in self.entries:
+            self.assertTrue(entry.name, "unnamed suppression")
+            self.assertTrue(entry.rationale.endswith("."), entry.name)
+            self.assertGreater(len(entry.rationale.split()), 5, entry.name)
+            self.assertIn(entry.evidence, (_CHECKER._MEASURED, _CHECKER._LATENT))
+
+    def test_evidence_census_matches_the_docstring_claim(self):
+        # The docstring says the first four fired on a real body and the last
+        # three are latent. If the corpus is ever re-measured, this is the
+        # assertion that has to change with it — which is the point: today the
+        # split is prose that no test can contradict.
+        measured = {
+            e.name for e in self.entries if e.evidence == _CHECKER._MEASURED
+        }
+        latent = {e.name for e in self.entries if e.evidence == _CHECKER._LATENT}
+        self.assertEqual(
+            measured,
+            {
+                "signature-footer",
+                "aligned-table-separator",
+                "indented-list-items",
+                "bot-authored-bodies",
+            },
+        )
+        self.assertEqual(
+            latent,
+            {
+                "bold-pseudo-heading",
+                "setext-underline-and-rule",
+                "dash-placeholder-line",
+            },
+        )
+        self.assertEqual(len(measured) + len(latent), 7)
+
+    def test_entry_names_a_live_rule_unless_it_is_the_gate_skip(self):
+        for entry in self.entries:
+            gate_level = not entry.guards
+            if gate_level:
+                self.assertIsNone(entry.rule, entry.name)
+                self.assertEqual(entry.control, "", entry.name)
+            else:
+                self.assertIsInstance(entry.rule, re.Pattern, entry.name)
+                self.assertTrue(entry.control, entry.name)
+
+    def test_each_rule_decides_its_own_witness(self):
+        # Six entries are excused BY the match; the dash-placeholder line is
+        # excused by the non-match, which is why the expectation is a field
+        # rather than an assumption.
+        for entry in self.entries:
+            if entry.rule is None:
+                continue
+            self.assertEqual(
+                _CHECKER._rule_applies(entry.rule, entry.witness),
+                entry.exempts_on_match,
+                entry.name,
+            )
+
+    def test_each_witness_comes_back_clean(self):
+        for entry in self.entries:
+            if not entry.guards:
+                continue
+            fired = {v.pattern for v in find_violations(entry.witness)}
+            self.assertEqual(fired & set(entry.guards), set(), entry.name)
+
+    def test_each_control_is_still_flagged(self):
+        # The narrowness half: the near-miss that differs only in the detail the
+        # exemption turns on must still be reported.
+        for entry in self.entries:
+            if not entry.guards:
+                continue
+            fired = {v.pattern for v in find_violations(entry.control)}
+            self.assertNotEqual(fired & set(entry.guards), set(), entry.name)
+
+    def test_gate_level_suppression_is_load_bearing(self):
+        gate_level = [e for e in self.entries if not e.guards]
+        self.assertTrue(gate_level, "no gate-level suppression to check")
+        for entry in gate_level:
+            self.assertTrue(
+                find_violations(entry.witness),
+                "the witness does not even flag, so the skip decides nothing",
+            )
+
+    def test_every_guard_names_a_pattern_this_check_emits(self):
+        emitted = set()
+        for entry in self.entries:
+            emitted |= {v.pattern for v in find_violations(entry.witness)}
+            if entry.control:
+                emitted |= {v.pattern for v in find_violations(entry.control)}
+        for entry in self.entries:
+            for pattern in entry.guards:
+                self.assertIn(pattern, emitted, f"{entry.name}: dead guard")
 
 
 class TestRunsCollapseIntoOneViolation(unittest.TestCase):
