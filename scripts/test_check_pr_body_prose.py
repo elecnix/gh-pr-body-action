@@ -42,6 +42,15 @@ prose = importlib.util.module_from_spec(_spec)
 assert _spec.loader is not None
 _spec.loader.exec_module(prose)
 
+# The shared seam both Python checkers report through, loaded here as well as
+# by the checker so these tests pin the seam itself rather than a re-export.
+_finding_spec = importlib.util.spec_from_file_location(
+    "finding", os.path.join(_HERE, "finding.py")
+)
+finding = importlib.util.module_from_spec(_finding_spec)
+assert _finding_spec.loader is not None
+_finding_spec.loader.exec_module(finding)
+
 _HAVE_VALE = shutil.which("vale") is not None
 
 # A body whose only violation is inside a markdown heading. Linted as markdown
@@ -144,9 +153,17 @@ class ExtensionTrap(unittest.TestCase):
             self.assertEqual(result.returncode, 0, "vale is expected to exit 0 here")
             self.assertIn("HeadingOnly", result.stdout)
 
-            status, report = prose.lint(BODY_WITH_HEADING_VIOLATION, config, root)
-            self.assertEqual(status, 1, report)
-            self.assertIn("HeadingOnly", report)
+            status, findings, detail = prose.lint(
+                BODY_WITH_HEADING_VIOLATION, config, root
+            )
+            self.assertEqual(status, 1, detail)
+            self.assertEqual(detail, "")
+            # The vale check name is the finding's pattern: the rule belongs to
+            # the calling repository, which is why no fixed identifier for it
+            # is listed in this repo's README.
+            self.assertEqual([f.pattern for f in findings], ["fixture.HeadingOnly"])
+            self.assertEqual(findings[0].start, 1)
+            self.assertEqual(findings[0].end, 1)
 
     def test_stdin_body_is_linted_as_markdown_too(self):
         """Stdin has no extension at all, so it is the trap's worst case."""
@@ -202,11 +219,12 @@ class ValeMissing(unittest.TestCase):
             config = _write_rules(root)
             self._without_vale_on_path()
 
-            status, report = prose.lint(
+            status, findings, report = prose.lint(
                 "Ordinary prose sits here.\n", config, root, sync=False
             )
 
         self.assertEqual(status, 2, report)
+        self.assertEqual(findings, [], "a linter that never ran found nothing")
         self.assertIn("vale is not installed", report)
         self.assertIn("no verdict is safe", report)
 
@@ -219,9 +237,12 @@ class ValeMissing(unittest.TestCase):
                 handle.write("Packages = example\n")
             self._without_vale_on_path()
 
-            status, report = prose.lint("Ordinary prose sits here.\n", config, root)
+            status, findings, report = prose.lint(
+                "Ordinary prose sits here.\n", config, root
+            )
 
         self.assertEqual(status, 2, report)
+        self.assertEqual(findings, [], "a linter that never ran found nothing")
         self.assertIn("vale is not installed", report)
         self.assertNotIn("vale sync failed", report)
 
@@ -268,9 +289,69 @@ class EmptyBody(unittest.TestCase):
 
 
 class Defang(unittest.TestCase):
-    def test_workflow_command_in_echoed_output_is_defanged(self):
-        self.assertNotEqual(prose._defang("::error::boom"), "::error::boom")
-        self.assertEqual(prose._defang("ordinary line"), "ordinary line")
+    """A PR body is author-controlled, so nothing it says reaches a log verbatim.
+
+    The assertions are on exact output, not on "something changed". The one
+    mechanism this action ships is a visible quote in front of a leading `::`,
+    and the mechanism it replaced was a zero-width space, which would have
+    satisfied every `assertNotEqual` written against it while being invisible
+    in the log and un-greppable in it.
+    """
+
+    def test_the_substitution_is_exact(self):
+        self.assertEqual(finding.defang("::error::boom"), "'::error::boom")
+        self.assertEqual(
+            finding.defang("   ::stop-commands::tok"), "   '::stop-commands::tok"
+        )
+
+    def test_an_ordinary_line_is_untouched(self):
+        self.assertEqual(finding.defang("ordinary line"), "ordinary line")
+
+    def test_a_mid_line_colon_pair_is_untouched(self):
+        self.assertEqual(finding.defang("see foo::bar"), "see foo::bar")
+
+    def test_nothing_invisible_survives_the_defang(self):
+        defanged = finding.defang("::error::boom")
+        self.assertTrue(defanged.isascii(), repr(defanged))
+        self.assertEqual(defanged, "'::error::boom")
+
+    def test_a_rule_cannot_smuggle_a_workflow_command_into_the_log(self):
+        # A rule's `Check` name comes from the caller's rule pack, but its
+        # `Message` is drawn from the body's own text, so a body can try to
+        # quote a command. It cannot become one: `Finding.render()` prefixes
+        # every message line with its locator, and the runner strips the indent
+        # but not the prefix. The shared defang sits underneath that as the
+        # second layer — it is what carries the format checker, whose evidence
+        # lines are the author's own text with nothing in front of them.
+        alert = {
+            "Line": 3,
+            "Span": [1, 2],
+            "Severity": "error",
+            "Check": "Fixture.Rule",
+            "Message": "::error:: a command quoted by a rule",
+        }
+        rendered = prose._finding(alert).render()
+        self.assertEqual(
+            rendered,
+            "Fixture.Rule (line 3)\n"
+            "    columns 1–2: error: ::error:: a command quoted by a rule",
+        )
+        for line in rendered.splitlines():
+            self.assertFalse(line.lstrip().startswith("::"))
+
+    def test_a_finding_render_is_the_shape_the_other_checkers_print(self):
+        alert = {
+            "Line": 2,
+            "Span": [10],
+            "Severity": "warning",
+            "Check": "Fixture.Rule",
+            "Message": "'forbidden' does not belong in a heading.",
+        }
+        self.assertEqual(
+            prose._finding(alert).render(),
+            "Fixture.Rule (line 2)\n"
+            "    column 10: warning: 'forbidden' does not belong in a heading.",
+        )
 
 
 @unittest.skipUnless(_HAVE_VALE, "vale is not installed")

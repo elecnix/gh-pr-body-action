@@ -24,8 +24,19 @@ Same input, two surfaces, two results. Hard-wrapping is *correct* in a committed
 | `collapsed-table` | header, separator, and data rows pipe-joined onto one line | one row per line |
 | `body-is-file-reference` | the whole body is a single `@/tmp/pr-body.md`-style file reference (the contents were never pasted) | paste the file's contents into the body |
 | `unparsable-mermaid` | a ` ```mermaid ` block the mermaid parser rejects (renders as an error box) | fix the diagram; check it in the mermaid live editor |
+| `unclosed-mermaid-fence` | a ` ```mermaid ` fence that never closes, so nothing renders at all | close the fence |
+
+Every pattern above is a string the checker actually prints, so searching a run log for one gives you exactly the findings it names. The unclosed fence is a separate identifier from `unparsable-mermaid` because it is a different defect with a different fix: mermaid never rejects it, because nothing parses it at all.
 
 The mermaid half runs the real `mermaid.parse()` against mermaid pinned to the 11.x major GitHub renders with, so a diagram fails exactly when GitHub shows an error box.
+
+### One finding shape
+
+All three checkers report the same thing: a pattern name, a 1-indexed line span, the checker's own message, and the author's evidence lines. The shape is defined once — [`scripts/finding.py`](scripts/finding.py) for the Python checkers, [`scripts/finding.mjs`](scripts/finding.mjs) for the mermaid one — and `Finding.render()` is the only way a finding reaches stdout, which is what makes the next paragraph structural rather than a convention three checkers have to remember.
+
+The [prose check](#prose-your-rules-not-ours) is the one case with no fixed identifier in the table: a vale alert's pattern is the calling repository's own check name, because a prose standard belongs to the project that wrote it.
+
+Two limits apply to every checker equally. A finding echoes at most 4 of its evidence lines, and a run prints at most 15 findings in full; in both cases the rest are summarised by count rather than dropped silently. And the exit-code contract is unchanged: `0` clean, skipped or empty; `1` at least one finding; `2` a usage or read failure.
 
 Bot-authored bodies are skipped. Code fences, HTML comments, nested lists, and bold pseudo-headings are not flagged — see the docstring of [`scripts/check-pr-body-format.py`](scripts/check-pr-body-format.py) for the full calibration and every deliberate suppression.
 
@@ -137,7 +148,7 @@ jobs:
           comment: ${{ github.event.comment.id }}
 ```
 
-Comment text is attacker-influenceable: anyone with read access can write it. The checker defangs `::` workflow commands when it echoes findings, and the job above is read-only and never gains write scopes. On the same calibration posture as the body check, this is advisory rather than required. The comment rule measured zero false positives over recent human-authored PR comments, but the corpus is thin (only a few multi-paragraph comments and one table), so the corpus must grow before the rule could be more than advisory.
+Comment text is attacker-influenceable: anyone with read access can write it. Every line a finding prints passes through one defang on its way out, so a body line that opens with `::` — the workflow-command syntax the Actions runner executes — is rewritten with a visible quote in front of it. A quote, deliberately, rather than an invisible character: the neutralised form stays greppable in a CI log and visible in the source, so a reader can account for every instance. `scripts/finding.py` carries the argument. The job above is read-only and never gains write scopes. On the same calibration posture as the body check, this is advisory rather than required. The comment rule measured zero false positives over recent human-authored PR comments, but the corpus is thin (only a few multi-paragraph comments and one table), so the corpus must grow before the rule could be more than advisory.
 
 ### Outputs
 
@@ -145,7 +156,7 @@ Comment text is attacker-influenceable: anyone with read access can write it. Th
 |---|---|
 | `violations` | combined exit code: `0` clean, `1` violation(s), `2` usage or read failure |
 
-Exit codes: `0` — no violations, empty body, or bot author. `1` — at least one violation, each printed with the pattern name, line range, and offending line(s). `2` — the body could not be read; a failed read is never reported as a clean body.
+Exit codes: `0` — no findings, empty body, or bot author. `1` — at least one finding, each printed with its pattern name, its line span, and its evidence: the offending line for the format checker, the parser's own reason for the mermaid checker, the caller's vale check name for the prose one. `2` — the body could not be read; a failed read is never reported as a clean body.
 
 ## Advisory, on purpose
 

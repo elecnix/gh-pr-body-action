@@ -57,10 +57,16 @@
  * (scripts/pr_body_source.py) and is held to it by a test.
  *   0  no violations, empty body, or the author is a bot (a dependabot body is
  *      machine HTML nobody will fix).
- *   1  at least one unparsable mermaid block, each printed with its line range
- *      and the mermaid error.
+ *   1  at least one unparsable mermaid block, each printed with its pattern
+ *      name, its line range, and the mermaid error.
  *   2  invalid usage, a failed API call, or an unreadable body — a failed
  *      read is never reported as clean.
+ *
+ * What a finding is — the pattern name, the line span, the message, the
+ * evidence lines and the defanged render — is defined once, in
+ * scripts/finding.mjs, the Node twin of scripts/finding.py. This file owns the
+ * two pattern identifiers below and the mermaid grammar itself, nothing else
+ * about the shape.
  *
  * Dependency pinning. mermaid is pinned EXACTLY (no ^) in scripts/package.json
  * to the 11.16.1 this gate was calibrated against, matching the major GitHub
@@ -70,6 +76,7 @@
  */
 
 import { JSDOM } from 'jsdom';
+import { Finding, renderReport } from './finding.mjs';
 
 // ---------------------------------------------------------------- DOM shim
 // Install a minimal jsdom window before mermaid is imported, so DOMPurify's
@@ -105,31 +112,28 @@ const _FENCE = /^\s*(`{3,})(\w*)\s*$/;
 // bare fence, are skipped (a bare fence is where JIRA-style text blocks live).
 const MERMAID_LANG = 'mermaid';
 
-// Defang a body line the Actions runner would read as a workflow command, so
-// echoing a finding can never execute `::error::` on a fork PR. Same guard as
-// check-pr-body-format.py: indent is not enough, the runner strips it first.
-function _defang(line) {
-  if (line.trimStart().startsWith('::')) {
-    return line.replace('::', "'::", 1);
-  }
-  return line;
-}
-
-/**
- * A single unparsable (or never-closed) mermaid block.
- * @typedef {{start: number, end: number, message: string}} BadBlock
- *   start/end are the 1-indexed inclusive line span of the whole ```mermaid
- *   fenced block — open fence line to closing fence line (or last body line
- *   when the fence never closes).
- */
+// The two patterns this checker emits. Both are real identifiers: a reader can
+// search a run log for either one and get exactly the blocks it names.
+//
+// The unclosed fence is a separate identifier rather than a second flavour of
+// `unparsable-mermaid` because it is a different defect with a different fix.
+// mermaid never rejects it — nothing parses it at all, so nothing renders.
+const UNPARSABLE = 'unparsable-mermaid';
+const UNCLOSED = 'unclosed-mermaid-fence';
 
 /**
  * Every ```mermaid fenced block whose body mermaid.parse rejects, plus any
  * ```mermaid fence that never closes. Valid blocks, non-mermaid fences, and
  * fences inside other fences produce nothing. Runs mermaid.parse per block, so
  * a body with many diagrams costs one parse each.
+ *
+ * The findings carry the parser's own reason and no evidence lines: the reason
+ * already names the offending token and the offending line, so echoing the
+ * diagram source would put more author-controlled bytes into the run log for no
+ * diagnostic gain. That is the opposite trade from the format checker, which
+ * echoes because a parser is not standing in the author's way.
  * @param {string} body
- * @returns {Promise<BadBlock[]>} findings in body order.
+ * @returns {Promise<Finding[]>} findings in body order.
  */
 export async function findBadMermaidBlocks(body) {
   if (!body) return [];
@@ -155,11 +159,9 @@ export async function findBadMermaidBlocks(body) {
         try {
           await mermaid.parse(content);
         } catch (err) {
-          out.push({
-            start: openLine, // fence-open line, 1-indexed
-            end,
-            message: _reason(err),
-          });
+          out.push(
+            new Finding(UNPARSABLE, openLine, end, { message: _reason(err) }),
+          );
         }
         openLine = 0;
       }
@@ -181,11 +183,11 @@ export async function findBadMermaidBlocks(body) {
   // A ```mermaid fence that never closes: nothing renders. Report it rather
   // than dropping it on the floor — and certainly never let it throw.
   if (openLine !== 0) {
-    out.push({
-      start: openLine,
-      end: lines.length,
-      message: 'mermaid fence never closes (no closing ``` found)',
-    });
+    out.push(
+      new Finding(UNCLOSED, openLine, lines.length, {
+        message: 'mermaid fence never closes (no closing ``` found)',
+      }),
+    );
   }
 
   out.sort((a, b) => a.start - b.start || a.end - b.end);
@@ -326,13 +328,14 @@ export async function main(argv) {
     return 0;
   }
 
-  console.log(`${bad.length} unparsable mermaid diagram(s) found:`);
-  for (const b of bad) {
-    console.log(`  lines ${b.start}–${b.end}: ${_defang(b.message)}`);
-  }
   console.log(
-    '\nFix by making the diagram parse: run it through the mermaid live editor,'
-    + ' or drop text between a dotted link\'s dots and fold it into the label.'
+    renderReport(
+      bad,
+      `${bad.length} unparsable mermaid diagram(s) found:`,
+      ['',
+        'Fix by making the diagram parse: run it through the mermaid live editor,'
+        + ' or drop text between a dotted link\'s dots and fold it into the label.'],
+    ),
   );
   return 1;
 }

@@ -151,6 +151,11 @@ Exit codes:
      range, and the offending line(s).
   2  invalid usage, the GitHub API call failed, or the body could not be read.
      A failed read is never reported as a clean body.
+
+What a finding is — the pattern name, the line span, the evidence lines and the
+defanged render — is defined once, in scripts/finding.py, and shared with the
+prose checker; the mermaid checker's Node twin is scripts/finding.mjs. This file
+owns the four pattern identifiers below and nothing else about the shape.
 """
 
 from __future__ import annotations
@@ -159,7 +164,16 @@ import argparse
 import os
 import re
 import sys
-from dataclasses import dataclass
+# The sibling module lives beside this script, not on the path a caller set up:
+# action.yml invokes this file by absolute path from an arbitrary working
+# directory, and the unit tests load it by file location. Either way the
+# directory below is where finding.py is.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+
+# pylint: disable=wrong-import-position
+from finding import Finding, render_report
 
 # The acquisition seam: this checker does not read the PR body, it asks
 # scripts/pr_body_source.py for one and receives text it did not fetch. Python
@@ -224,48 +238,6 @@ _CONTINUATION_START = re.compile(r"^\s*[a-z0-9:;,—–]")
 # leading `/`, or a file extension, optionally under directories) so an
 # `@username` or `@org/team` mention-only body is not flagged.
 _FILE_REFERENCE = re.compile(r"^@(?:\S*/\S*\.\w{1,5}|/\S+|\S+\.\w{1,5})$")
-
-
-# How many offending lines to print before summarizing the rest. A hard-wrapped
-# body is one defect with one fix, so echoing all 300 of its lines back buys the
-# author nothing and buries every other finding in the run log.
-_MAX_ECHOED_LINES = 4
-# How many violations to print in full. A body wrapped end to end makes every
-# paragraph a finding, and past the first handful the reader has the message.
-_MAX_REPORTED = 15
-
-
-def _defang(line: str) -> str:
-    """Neutralize a line the Actions runner would read as a workflow command.
-
-    A PR body is attacker-influenceable on a fork PR, and the runner parses any
-    stdout line whose first non-space characters are `::` — so a body line of
-    `::error::` or `::stop-commands::<tok>` would otherwise be executed as a
-    command rather than printed as evidence. Indenting is not enough: the runner
-    strips leading whitespace before it looks. Today the blast radius is small
-    (a `pull_request` trigger, a read-only token, no secrets in the job), so this
-    buys spoofed annotations only — but it stops being small the first time this
-    workflow gains a write scope, and it costs one substitution.
-    """
-    if line.lstrip().startswith("::"):
-        return line.replace("::", "'::", 1)
-    return line
-
-
-@dataclass(frozen=True)
-class Violation:
-    pattern: str
-    start: int  # 1-indexed, inclusive
-    end: int  # 1-indexed, inclusive
-    lines: tuple[str, ...]
-
-    def render(self) -> str:
-        head = f"{self.pattern} (lines {self.start}–{self.end})"
-        shown = [f"    {_defang(ln)}" for ln in self.lines[:_MAX_ECHOED_LINES]]
-        hidden = len(self.lines) - len(shown)
-        if hidden > 0:
-            shown.append(f"    … {hidden} more line(s) in the same run")
-        return "\n".join([head, *shown])
 
 
 def _classify(line: str) -> str:
@@ -360,7 +332,7 @@ def _is_paragraph_hard_break(prev: str, cur: str) -> bool:
     return True
 
 
-def _find_paragraph_hard_breaks(lines: list[str]) -> list[Violation]:
+def _find_paragraph_hard_breaks(lines: list[str]) -> list[Finding]:
     """One violation per wrapped *run*, not per adjacent pair.
 
     A hard-wrapped paragraph is a single defect with a single fix, but every
@@ -368,14 +340,14 @@ def _find_paragraph_hard_breaks(lines: list[str]) -> list[Violation]:
     wrapped body into 128 findings and a 25 KB run log that buried the other
     patterns, so a run of broken lines collapses into one violation spanning it.
     """
-    out: list[Violation] = []
+    out: list[Finding] = []
     run_start: int | None = None
 
     def close(run_end: int) -> None:
         # `run_end` is the index of the last line in the run, inclusive.
         assert run_start is not None
         out.append(
-            Violation(
+            Finding(
                 pattern="hard-newline-in-paragraph",
                 start=run_start + 1,
                 end=run_end + 1,
@@ -402,8 +374,8 @@ def _find_paragraph_hard_breaks(lines: list[str]) -> list[Violation]:
     return out
 
 
-def _find_list_item_hard_breaks(lines: list[str]) -> list[Violation]:
-    out: list[Violation] = []
+def _find_list_item_hard_breaks(lines: list[str]) -> list[Finding]:
+    out: list[Finding] = []
     for i in range(len(lines) - 1):
         prev, cur = lines[i], lines[i + 1]
         # The bug: a list item immediately followed by a prose line at column
@@ -421,7 +393,7 @@ def _find_list_item_hard_breaks(lines: list[str]) -> list[Violation]:
         # break is intended — a deliberate second paragraph in a list item is
         # written with a blank line and an indent, which never reaches here.
         out.append(
-            Violation(
+            Finding(
                 pattern="hard-newline-in-list-item",
                 start=i + 1,
                 end=i + 2,
@@ -481,15 +453,15 @@ def _is_collapsed_table_row(line: str) -> bool:
     return False
 
 
-def _find_collapsed_tables(lines: list[str]) -> list[Violation]:
+def _find_collapsed_tables(lines: list[str]) -> list[Finding]:
     """Every table row that has swallowed the rows around it."""
-    out: list[Violation] = []
+    out: list[Finding] = []
     for i, line in enumerate(lines):
         if _classify(line) != "table":
             continue
         if _is_collapsed_table_row(line):
             out.append(
-                Violation(
+                Finding(
                     pattern="collapsed-table",
                     start=i + 1,
                     end=i + 1,
@@ -499,7 +471,7 @@ def _find_collapsed_tables(lines: list[str]) -> list[Violation]:
     return out
 
 
-def _find_file_reference_body(body: str, comment: bool = False) -> list[Violation]:
+def _find_file_reference_body(body: str, comment: bool = False) -> list[Finding]:
     """A body that is, or in comment mode opens with, one `@<path>` token.
 
     The reference renders as literal text (nothing expands it), so reviewers
@@ -524,7 +496,7 @@ def _find_file_reference_body(body: str, comment: bool = False) -> list[Violatio
         # match the token, so it falls through to the empty return.
         if _FILE_REFERENCE.match(lines[0]):
             return [
-                Violation(
+                Finding(
                     pattern="body-is-file-reference",
                     start=1,
                     end=1,
@@ -535,7 +507,7 @@ def _find_file_reference_body(body: str, comment: bool = False) -> list[Violatio
     if "\n" in stripped or not _FILE_REFERENCE.match(stripped):
         return []
     return [
-        Violation(
+        Finding(
             pattern="body-is-file-reference",
             start=1,
             end=1,
@@ -544,7 +516,7 @@ def _find_file_reference_body(body: str, comment: bool = False) -> list[Violatio
     ]
 
 
-def find_violations(body: str, comment: bool = False) -> list[Violation]:
+def find_violations(body: str, comment: bool = False) -> list[Finding]:
     """All four formatting bugs in the PR body, in line order.
 
     `comment=True` widens the file-reference rule to a leading token above
@@ -555,7 +527,7 @@ def find_violations(body: str, comment: bool = False) -> list[Violation]:
         return []
     lines = body.split("\n")
     masked = _strip_masked(lines)
-    violations: list[Violation] = []
+    violations: list[Finding] = []
     violations.extend(_find_file_reference_body(body, comment=comment))
     violations.extend(_find_paragraph_hard_breaks(masked))
     violations.extend(_find_list_item_hard_breaks(masked))
@@ -632,31 +604,31 @@ def main(argv: list[str] | None = None) -> int:
         print(f"skipped: the {surface} was written by a bot")
         return 0
 
-    violations = find_violations(body, comment=args.comment is not None)
-    if not violations:
+    findings = find_violations(body, comment=args.comment is not None)
+    if not findings:
         if not body.strip():
             print(f"no {surface} to check (empty)")
         else:
             print("no PR-body formatting violations")
         return 0
 
-    print(
-        f"{len(violations)} PR-body formatting violation(s) found:"
-    )
-    for v in violations[:_MAX_REPORTED]:
-        print()
-        print(v.render())
-    if len(violations) > _MAX_REPORTED:
-        print(f"\n… and {len(violations) - _MAX_REPORTED} more, same patterns.")
-    print(
-        "\nFix by separating paragraphs with a blank line, continuing list items"
-        " with indentation, or putting each table row on its own line."
-    )
-    if any(v.pattern == "body-is-file-reference" for v in violations):
-        print(
+    footers = [
+        "",
+        "Fix by separating paragraphs with a blank line, continuing list items"
+        " with indentation, or putting each table row on its own line.",
+    ]
+    if any(f.pattern == "body-is-file-reference" for f in findings):
+        footers.append(
             f"The {surface} is a file reference (@path), not content: paste the"
             f" file's contents into the {surface} instead of its path."
         )
+    print(
+        render_report(
+            findings,
+            f"{len(findings)} PR-body formatting violation(s) found:",
+            footers,
+        )
+    )
     return 1
 
 
