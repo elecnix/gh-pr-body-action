@@ -26,6 +26,23 @@ jobs:
       - name: Python checker unit tests
         run: python3 scripts/test_check_pr_body_format.py
 
+  test-orchestrator:
+    # The action's wiring — which surface, which checkers, in what order, and
+    # how their exit codes combine — was three bash `run:` blocks in action.yml,
+    # which this workflow could not reach. This job is the one that can.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.x'
+
+      # No vale and no node needed: the orchestrator's decisions are about
+      # which command runs, not what it prints, so the checkers are stubbed.
+      - name: Orchestrator unit tests
+        run: python3 scripts/test_check_pr_body_orchestrator.py
+
   test-prose-checker:
     runs-on: ubuntu-latest
     steps:

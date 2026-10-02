@@ -22,8 +22,10 @@ inputs:
     description: >-
       Pull-request comment id. When set, the format checker runs against that
       comment instead of the PR description (the mermaid checker has no comment
-      mode and is skipped). Mutually exclusive with pr. Defaults to the comment
-      id from the issue_comment event.
+      mode and is skipped). Comment mode also skips the prose check, which
+      lints a pull-request description and says so when it skips; wire a second
+      step to lint both. Wiring both `comment` and `pr` is an error. Defaults to
+      the comment id from the issue_comment event.
     required: false
     default: ${{ github.event.comment.id }}
   token:
@@ -68,7 +70,7 @@ outputs:
     value: ${{ steps.check.outputs.rc }}
   prose:
     description: 'The prose checker exit code (0 clean or skipped, 1 finding, 2 could not run).'
-    value: ${{ steps.prose.outputs.rc }}
+    value: ${{ steps.check.outputs.prose_rc }}
 
 runs:
   using: 'composite'
@@ -87,54 +89,14 @@ runs:
       working-directory: ${{ github.action_path }}/scripts
       run: npm ci
 
-    - name: Check PR body formatting
-      id: check
-      shell: bash
-      env:
-        GITHUB_TOKEN: ${{ inputs.token }}
-        PR_REPO: ${{ inputs.repo }}
-        PR_NUMBER: ${{ inputs.pr }}
-        COMMENT_ID: ${{ inputs.comment }}
-        ACTION_DIR: ${{ github.action_path }}
-      run: |
-        if [ -z "$PR_NUMBER" ] && [ -z "$COMMENT_ID" ]; then
-          echo "::notice::No pull-request number or comment id available (not a pull_request or issue_comment event); skipping."
-          echo "rc=0" >> "$GITHUB_OUTPUT"
-          exit 0
-        fi
-
-        # Both checkers run even when one is red, so an author with a wrapped
-        # paragraph AND a bad diagram sees both findings in one run. errexit is
-        # on by default, so capture each rc with it off.
-        set +e
-        if [ -n "$COMMENT_ID" ]; then
-          # Comment mode: one comment, one REST fetch, and the mermaid checker
-          # does not apply to it. Comment text is attacker-influenceable, so
-          # the job stays read-only and never gains write scopes; the checker
-          # defangs `::` workflow commands when it echoes findings.
-          python3 "$ACTION_DIR/scripts/check-pr-body-format.py" \
-            --repo "$PR_REPO" --comment "$COMMENT_ID"
-          rc1=$?
-          echo "rc=$rc1" >> "$GITHUB_OUTPUT"
-          set -e
-          exit "$rc1"
-        fi
-        python3 "$ACTION_DIR/scripts/check-pr-body-format.py" \
-          --repo "$PR_REPO" --pr "$PR_NUMBER"
-        rc1=$?
-        node "$ACTION_DIR/scripts/check-pr-body-mermaid.mjs" \
-          --repo "$PR_REPO" --pr "$PR_NUMBER"
-        rc2=$?
-        set -e
-        rc=$((rc1 || rc2))
-        echo "rc=$rc" >> "$GITHUB_OUTPUT"
-        exit "$rc"
-
-    # The prose step runs after the format step and never short-circuits it: an
-    # author with a wrapped paragraph AND an off-house sentence should see both
-    # in one run rather than one per push.
+    # vale is provisioned, not reasoned about. The orchestrator below decides
+    # whether the prose check runs at all, so the only question left here is
+    # whether this job asked for prose in the first place. A comment-mode run
+    # therefore installs a binary the orchestrator will not call; the
+    # alternative is choosing the mode here as well, which is the split this
+    # change exists to remove.
     - name: Install vale
-      if: ${{ always() && inputs.prose == 'true' && inputs.pr != '' }}
+      if: ${{ always() && inputs.prose == 'true' }}
       shell: bash
       env:
         VALE_VERSION: ${{ inputs.vale-version }}
@@ -156,33 +118,28 @@ runs:
         echo "$bin" >> "$GITHUB_PATH"
         "$bin/vale" --version
 
-    - name: Check PR body prose
-      id: prose
-      if: ${{ always() && inputs.prose == 'true' && inputs.pr != '' }}
+    # Every decision the action makes lives in one script, because every one of
+    # them is a rule: which surface to check, which checkers to run and in what
+    # order, how their exit codes combine, and what a prose finding is worth.
+    # It was bash in three `run:` blocks here, which had no test file and no CI
+    # job — the shellcheck job globs scripts/*.sh, and a `run:` block is not a
+    # file. See the docstring of the orchestrator for each rule.
+    - name: Check PR body
+      id: check
       shell: bash
       env:
         GITHUB_TOKEN: ${{ inputs.token }}
         PR_REPO: ${{ inputs.repo }}
         PR_NUMBER: ${{ inputs.pr }}
-        RULES_DIR: ${{ inputs.prose-rules-dir }}
+        COMMENT_ID: ${{ inputs.comment }}
+        PROSE: ${{ inputs.prose }}
         PROSE_FAIL: ${{ inputs.prose-fail }}
-        ACTION_DIR: ${{ github.action_path }}
+        RULES_DIR: ${{ inputs.prose-rules-dir }}
       run: |
-        set +e
-        python3 "$ACTION_DIR/scripts/check-pr-body-prose.py" \
-          --repo "$PR_REPO" --pr "$PR_NUMBER" --rules-dir "$RULES_DIR"
-        rc=$?
-        set -e
-        echo "rc=$rc" >> "$GITHUB_OUTPUT"
-        # rc 2 is "the linter never ran", which is a failure however the repo
-        # has set prose-fail: a check that did not start has not passed.
-        if [ "$rc" -ge 2 ]; then
-          echo "::error::The prose check could not run."
-          exit 1
-        fi
-        if [ "$rc" -eq 1 ] && [ "$PROSE_FAIL" = "true" ]; then
-          exit 1
-        fi
-        if [ "$rc" -eq 1 ]; then
-          echo "::warning::The description does not match this repository's prose rules; see the step log."
-        fi
+        python3 "${{ github.action_path }}/scripts/check-pr-body-orchestrator.py" \
+          --repo "$PR_REPO" \
+          --pr "$PR_NUMBER" \
+          --comment "$COMMENT_ID" \
+          --prose "$PROSE" \
+          --prose-fail "$PROSE_FAIL" \
+          --rules-dir "$RULES_DIR"
