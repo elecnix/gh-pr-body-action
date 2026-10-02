@@ -139,6 +139,12 @@ Local repro against a saved body (deterministic, no network):
     python3 scripts/check-pr-body-format.py --body-file body.md
     cat body.md | python3 scripts/check-pr-body-format.py --body-file -
 
+Where the body comes from is not decided here. `scripts/pr_body_source.py`
+owns the file, stdin and REST sources, the token precedence
+(`GITHUB_TOKEN`, then `GH_TOKEN`), the bot-author rule, and the single
+error type every failed read raises so it can never be mistaken for a clean
+body; this file asks it for one and checks what comes back.
+
 Exit codes:
   0  no violations, the body is empty, or the author is a bot.
   1  at least one violation; each is printed with the pattern name, the line
@@ -150,13 +156,22 @@ Exit codes:
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import re
 import sys
-import urllib.error
-import urllib.request
 from dataclasses import dataclass
+
+# The acquisition seam: this checker does not read the PR body, it asks
+# scripts/pr_body_source.py for one and receives text it did not fetch. Python
+# puts a script's own directory on `sys.path`, so the import resolves under every
+# invocation this action uses (`python3 scripts/…`, an absolute path from
+# action.yml, and the unit tests). The guard is for the one case it does not
+# cover: a caller that imports this file as a module from elsewhere.
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+if _SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPT_DIR)
+
+import pr_body_source  # noqa: E402  (needs the path above)
 
 
 # A line is "structural" when a renderer treats it as anything other than a
@@ -549,46 +564,17 @@ def find_violations(body: str, comment: bool = False) -> list[Violation]:
     return violations
 
 
-def _fetch_body(repo: str, pr: int, token: str) -> tuple[str, bool]:
-    """The PR body and whether a bot wrote it, in one REST read.
+def _acquire(args: argparse.Namespace) -> pr_body_source.Body:
+    """The body to check, from whichever source the flags selected.
 
-    A direct HTTPS call to the REST API via urllib, so no gh CLI is required:
-    running the check needs nothing but a token in the environment. REST, not
-    GraphQL: the repo's shared GraphQL budget is the scarce one. A failed read
-    raises rather than returning an empty body, so it can never be mistaken
-    for a PR with nothing wrong in it.
+    Three sources, one decision — which of them applies belongs to the seam, not
+    to each checker that happens to need a body.
     """
-    url = f"https://api.github.com/repos/{repo}/pulls/{pr}"
-    return _fetch_rest(repo, url, token)
-
-
-def _fetch_comment(repo: str, comment_id: int, token: str) -> tuple[str, bool]:
-    """One PR comment and whether a bot wrote it, in one REST read.
-
-    `GET /repos/{owner}/{repo}/issues/comments/{id}` is the issues-comments
-    endpoint, which serves PR comments too. Same REST approach as `_fetch_body`,
-    same bot-author skip, still one API call and still no GraphQL spend. A
-    comment on an `issue_comment` event lives in the base repo, so the event's
-    own token reads it and no additional scope work is needed.
-    """
-    url = f"https://api.github.com/repos/{repo}/issues/comments/{comment_id}"
-    return _fetch_rest(repo, url, token)
-
-
-def _fetch_rest(repo: str, url: str, token: str) -> tuple[str, bool]:
-    """The shared REST read behind the `--pr` and `--comment` modes."""
-    request = urllib.request.Request(
-        url,
-        headers={
-            "Accept": "application/vnd.github+json",
-            "Authorization": f"Bearer {token}",
-            "X-GitHub-Api-Version": "2022-11-28",
-            "User-Agent": "gh-pr-body-action",
-        },
-    )
-    with urllib.request.urlopen(request, timeout=30) as response:
-        payload = json.load(response)
-    return payload.get("body") or "", payload.get("user", {}).get("type") == "Bot"
+    if args.body_file:
+        return pr_body_source.Body(pr_body_source.read_body_file(args.body_file), False)
+    if args.comment is not None:
+        return pr_body_source.fetch_comment(args.repo, args.comment)
+    return pr_body_source.fetch_pull_request(args.repo, args.pr)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -631,29 +617,14 @@ def main(argv: list[str] | None = None) -> int:
     surface = "comment" if args.comment is not None else "PR body"
 
     try:
-        if args.body_file:
-            if args.body_file == "-":
-                body = sys.stdin.read()
-            else:
-                with open(args.body_file, encoding="utf-8", errors="replace") as fh:
-                    body = fh.read()
-            is_bot = False
-        else:
-            token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
-            if not token:
-                print(
-                    "error: no token for the GitHub API call — set GITHUB_TOKEN"
-                    " (or GH_TOKEN)",
-                    file=sys.stderr,
-                )
-                return 2
-            if args.comment is not None:
-                body, is_bot = _fetch_comment(args.repo, args.comment, token)
-            else:
-                body, is_bot = _fetch_body(args.repo, args.pr, token)
-    except (urllib.error.URLError, OSError, RuntimeError, ValueError) as exc:
+        acquired = _acquire(args)
+    except pr_body_source.BodyReadError as exc:
+        # One exception type for every way the read can fail, including a
+        # missing token. Exit 2, never 0: an unread body is not a clean one.
         print(f"error: {exc}", file=sys.stderr)
         return 2
+
+    body, is_bot = acquired.text, acquired.is_bot
 
     if is_bot:
         # A dependabot body is a several-hundred-line raw HTML changelog dump.

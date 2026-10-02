@@ -52,6 +52,9 @@
  *     node scripts/check-pr-body-mermaid.mjs --body-file body.md  # or '-'
  *     node scripts/check-pr-body-mermaid.mjs --repo O/R --pr 1234 # via the REST API
  *
+ * Reading the body is not this file's job beyond the token: the read itself is
+ * `_fetchBody` below, which implements the same contract as the Python seam
+ * (scripts/pr_body_source.py) and is held to it by a test.
  *   0  no violations, empty body, or the author is a bot (a dependabot body is
  *      machine HTML nobody will fix).
  *   1  at least one unparsable mermaid block, each printed with its line range
@@ -192,14 +195,39 @@ export async function findBadMermaidBlocks(body) {
 // ------------------------------------------------------------------ fetching
 
 /**
+ * Token precedence, in order: the first non-empty one wins.
+ *
+ * This is the one piece of the acquisition contract that is duplicated rather
+ * than shared. `scripts/pr_body_source.py` is the normative owner for the two
+ * Python checkers and cannot be imported from here, and shelling out to it
+ * would trade the whole point of that module for nothing — so this list is a
+ * copy, held honest by `test_check_pr_body_mermaid.mjs`, which reads the tuple
+ * out of the Python module and asserts these names match in this order. The
+ * copy is not a decision: it cannot drift without a test going red.
+ */
+export const _TOKEN_ENV_VARS = ['GITHUB_TOKEN', 'GH_TOKEN'];
+
+/**
+ * The token to authenticate the API read with, or null when none is exported.
+ * @param {NodeJS.ProcessEnv} [env]
+ * @returns {string|null}
+ */
+export function _resolveToken(env = process.env) {
+  for (const name of _TOKEN_ENV_VARS) {
+    if (env[name]) return env[name];
+  }
+  return null;
+}
+
+/**
  * The PR body and whether a bot wrote it, in one REST read.
  *
- * A direct HTTPS call via fetch — no gh CLI required, so running the check
- * needs nothing but a token in the environment (GITHUB_TOKEN or GH_TOKEN).
- * REST, not GraphQL: the repo's shared GraphQL budget is the scarce one. A
- * failed read raises rather than returning an empty body, so a failed read can
- * never be mistaken for a PR with nothing wrong in it. Mirrors
- * check-pr-body-format.py.
+ * A direct HTTPS call via fetch — no GitHub CLI required, so running the check
+ * needs nothing but a token in the environment. REST, not GraphQL: the repo's
+ * shared GraphQL budget is the scarce one. A failed read throws rather than
+ * returning an empty body, so a failed read can never be mistaken for a PR with
+ * nothing wrong in it. Same contract as the Python seam; see the note on
+ * `_TOKEN_ENV_VARS` above for what is pinned and by what.
  * @param {string} repo OWNER/REPO
  * @param {number} pr pull-request number
  * @param {string} token GitHub API token
@@ -272,10 +300,10 @@ export async function main(argv) {
       }
       bot = false;
     } else {
-      const token = process.env.GITHUB_TOKEN || process.env.GH_TOKEN;
+      const token = _resolveToken();
       if (!token) {
         process.stderr.write(
-          'error: no token for the GitHub API call — set GITHUB_TOKEN (or GH_TOKEN)\n',
+          `error: no token for the GitHub API call — set ${_TOKEN_ENV_VARS.join(' or ')}\n`,
         );
         return 2;
       }

@@ -232,3 +232,45 @@ test('_fetchBody raises on a failed read, never returns a clean body', async () 
     globalThis.fetch = originalFetch;
   }
 });
+
+// ------------------------------------------- parity with the Python seam
+
+/*
+ * The acquisition contract is owned by scripts/pr_body_source.py, which this
+ * file cannot import. Rather than let the copy rot, these tests read the
+ * Python module's source and hold this one to it. The token precedence is the
+ * part that has already drifted once — the prose checker resolved
+ * `GITHUB_TOKEN` alone while this file and the format checker accepted
+ * `GH_TOKEN` as well, so a caller exporting one of the two got a verdict from
+ * two checkers and a refusal from the third.
+ */
+
+const readFileSync = (await import('node:fs')).readFileSync;
+const { fileURLToPath } = await import('node:url');
+const seamPath = fileURLToPath(new URL('./pr_body_source.py', import.meta.url));
+
+/** The names in the Python seam's `TOKEN_ENV_VARS`, in order. */
+function seamTokenEnvVars() {
+  const source = readFileSync(seamPath, 'utf8');
+  const match = source.match(/^TOKEN_ENV_VARS\s*=\s*\(([^)]*)\)/m);
+  assert.ok(match, 'TOKEN_ENV_VARS is missing from scripts/pr_body_source.py');
+  return match[1]
+    .split(',')
+    .map((name) => name.trim().replace(/^["']|["']$/g, ''))
+    .filter(Boolean);
+}
+
+test('the token precedence matches the Python seam, name for name and in order', () => {
+  // The assertion is written as equality with the seam, not as a literal, so
+  // changing the seam's precedence is a decision that updates both sides at
+  // once in review rather than a silent one-sided edit.
+  assert.deepEqual([...checker._TOKEN_ENV_VARS], seamTokenEnvVars());
+});
+
+test('_resolveToken prefers the first name and falls back to the second', () => {
+  const [first, second] = checker._TOKEN_ENV_VARS;
+  assert.equal(checker._resolveToken({ [first]: 'a', [second]: 'b' }), 'a');
+  assert.equal(checker._resolveToken({ [second]: 'b' }), 'b');
+  assert.equal(checker._resolveToken({ [first]: '', [second]: 'b' }), 'b');
+  assert.equal(checker._resolveToken({}), null);
+});

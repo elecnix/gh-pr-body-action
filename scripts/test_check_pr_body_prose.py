@@ -32,6 +32,7 @@ import tempfile
 import textwrap
 import unittest
 from contextlib import redirect_stdout
+from unittest import mock
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _SCRIPT = os.path.join(_HERE, "check-pr-body-prose.py")
@@ -270,6 +271,87 @@ class Defang(unittest.TestCase):
     def test_workflow_command_in_echoed_output_is_defanged(self):
         self.assertNotEqual(prose._defang("::error::boom"), "::error::boom")
         self.assertEqual(prose._defang("ordinary line"), "ordinary line")
+
+
+@unittest.skipUnless(_HAVE_VALE, "vale is not installed")
+class AcquisitionSeam(unittest.TestCase):
+    """The `--repo/--pr` path goes through scripts/pr_body_source.py.
+
+    Two things this pins, both of which this checker used to get wrong on its
+    own: it accepted only `GITHUB_TOKEN`, and it decided what a failed read
+    meant by catching every exception rather than one declared type. Both are
+    the seam's business now, and both are observable from here.
+    """
+
+    def _env_with(self, **tokens):
+        env = {k: v for k, v in os.environ.items()}
+        env.pop("GITHUB_TOKEN", None)
+        env.pop("GH_TOKEN", None)
+        env.update(tokens)
+        return env
+
+    def test_gh_token_alone_reads_the_body(self):
+        # The divergence: exporting only `GH_TOKEN` used to end this check at
+        # "GITHUB_TOKEN is required", while the format and mermaid checkers in
+        # the same action ran. The socket is stubbed, so what is under test is
+        # the token resolution the seam performs before it opens it.
+        with tempfile.TemporaryDirectory() as root:
+            _write_rules(root)
+            payload = json.dumps(
+                {"body": BODY_WITH_HEADING_VIOLATION, "user": {"type": "User"}}
+            ).encode()
+            buffer = io.StringIO()
+            with mock.patch.dict(
+                os.environ, self._env_with(GH_TOKEN="tok"), clear=True
+            ), mock.patch(
+                "urllib.request.urlopen", return_value=io.BytesIO(payload)
+            ), redirect_stdout(buffer):
+                status = prose.main(
+                    ["--repo", "o/r", "--pr", "7", "--rules-dir", root]
+                )
+        self.assertEqual(status, 1, buffer.getvalue())
+        self.assertIn("HeadingOnly", buffer.getvalue())
+
+    def test_no_token_at_all_is_a_read_failure_not_a_clean_body(self):
+        with tempfile.TemporaryDirectory() as root:
+            _write_rules(root)
+            buffer = io.StringIO()
+            with mock.patch.dict(
+                os.environ, self._env_with(), clear=True
+            ), redirect_stdout(buffer):
+                status = prose.main(
+                    ["--repo", "o/r", "--pr", "7", "--rules-dir", root]
+                )
+        self.assertEqual(status, 2)
+        self.assertEqual(buffer.getvalue(), "")
+
+    def test_failed_api_read_is_two_never_clean(self):
+        import urllib.error
+
+        def raise_404(req, **kwargs):
+            raise urllib.error.HTTPError(req.full_url, 404, "Not Found", None, None)
+
+        with tempfile.TemporaryDirectory() as root:
+            _write_rules(root)
+            buffer = io.StringIO()
+            with mock.patch.dict(
+                os.environ, self._env_with(GITHUB_TOKEN="tok"), clear=True
+            ), mock.patch(
+                "urllib.request.urlopen", side_effect=raise_404
+            ), redirect_stdout(buffer):
+                status = prose.main(
+                    ["--repo", "o/r", "--pr", "7", "--rules-dir", root]
+                )
+        self.assertEqual(status, 2)
+        self.assertEqual(buffer.getvalue(), "")
+
+    def test_unreadable_body_file_is_two(self):
+        with tempfile.TemporaryDirectory() as root:
+            _write_rules(root)
+            status = prose.main(
+                ["--body-file", os.path.join(root, "absent.md"), "--rules-dir", root]
+            )
+        self.assertEqual(status, 2)
 
 
 if __name__ == "__main__":

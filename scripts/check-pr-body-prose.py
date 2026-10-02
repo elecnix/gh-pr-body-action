@@ -45,6 +45,12 @@ Usage:
     cat body.md | python3 scripts/check-pr-body-prose.py --body-file -
     python3 scripts/check-pr-body-prose.py --repo OWNER/REPO --pr 1234
 
+The body itself is never read here. `scripts/pr_body_source.py` owns the
+file, stdin and REST sources, the token precedence (`GITHUB_TOKEN`, then
+`GH_TOKEN`), and the rule that a failed read raises instead of returning an
+empty body. This file's own `GITHUB_TOKEN`-only lookup, which silently made
+this the one checker a caller exporting `GH_TOKEN` could not run, is gone.
+
 Exit codes:
 
     0  clean, or skipped because the repo has no rules
@@ -65,7 +71,19 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import urllib.request
+
+# The acquisition seam. This checker does not read the PR body; it asks
+# scripts/pr_body_source.py for one, the same module the format checker asks.
+# Before that it read `GITHUB_TOKEN` and nothing else, so a caller exporting
+# only `GH_TOKEN` got a format verdict and a prose check that refused to start.
+# Python puts a script's own directory on `sys.path`, so the import resolves
+# under every invocation this action uses (`python3 scripts/…`, an absolute path
+# from action.yml, and the unit tests).
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+if _SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPT_DIR)
+
+import pr_body_source  # noqa: E402  (needs the path above)
 
 # The name the body is copied to. The extension is the whole point; see above.
 _BODY_FILENAME = "pr-body.md"
@@ -173,26 +191,6 @@ def _read_text(path: str) -> str:
         return handle.read()
 
 
-def _fetch_body(repo: str, pr: int, token: str) -> tuple[str, bool]:
-    """The PR body and whether a bot wrote it, in one REST read.
-
-    Mirrors the sibling checker: urllib against REST, no gh CLI, and a failed
-    read raises rather than returning an empty body that would read as clean.
-    """
-    request = urllib.request.Request(
-        f"https://api.github.com/repos/{repo}/pulls/{pr}",
-        headers={
-            "Accept": "application/vnd.github+json",
-            "Authorization": f"Bearer {token}",
-            "X-GitHub-Api-Version": "2022-11-28",
-            "User-Agent": "gh-pr-body-action",
-        },
-    )
-    with urllib.request.urlopen(request, timeout=30) as response:
-        payload = json.load(response)
-    return payload.get("body") or "", payload.get("user", {}).get("type") == "Bot"
-
-
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Lint a PR description against the calling repo's own prose rules.",
@@ -234,27 +232,24 @@ def main(argv: list[str] | None = None) -> int:
         print(f"prose: {_VALE_MISSING}", file=sys.stderr)
         return 2
 
-    if args.body_file:
-        try:
-            body = sys.stdin.read() if args.body_file == "-" else _read_text(args.body_file)
-        except OSError as exc:
-            print(f"prose: could not read the body: {exc}", file=sys.stderr)
-            return 2
-    elif args.repo and args.pr:
-        token = os.environ.get("GITHUB_TOKEN", "")
-        if not token:
-            print("prose: GITHUB_TOKEN is required to read a PR body.", file=sys.stderr)
-            return 2
-        try:
-            body, is_bot = _fetch_body(args.repo, args.pr, token)
-        except Exception as exc:  # noqa: BLE001 - any read failure is "cannot run"
-            print(f"prose: could not read PR #{args.pr}: {exc}", file=sys.stderr)
-            return 2
-        if is_bot:
-            print("prose: skipped, the body was written by a bot.")
-            return 0
-    else:
-        parser.error("give --body-file, or both --repo and --pr")
+    try:
+        if args.body_file:
+            body = pr_body_source.read_body_file(args.body_file)
+        elif args.repo and args.pr:
+            acquired = pr_body_source.fetch_pull_request(args.repo, args.pr)
+            if acquired.is_bot:
+                print("prose: skipped, the body was written by a bot.")
+                return 0
+            body = acquired.text
+        else:
+            parser.error("give --body-file, or both --repo and --pr")
+    except pr_body_source.BodyReadError as exc:
+        # The seam raises one type for every failed read — an unreadable file, a
+        # dead network, a 404, a 200 that is not JSON, no token at all. None of
+        # them may be reported as a clean body, so none of them reach the
+        # linter.
+        print(f"prose: {exc}", file=sys.stderr)
+        return 2
 
     if not body.strip():
         print("prose: the body is empty, so there is nothing to lint.")
