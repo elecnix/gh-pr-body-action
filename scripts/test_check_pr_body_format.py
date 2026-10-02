@@ -22,6 +22,7 @@ import unittest.mock
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _SCRIPT = os.path.join(_HERE, "check-pr-body-format.py")
+_SEAM = os.path.join(_HERE, "pr_body_source.py")
 
 
 def _load():
@@ -36,6 +37,11 @@ def _load():
 _CHECKER = _load()
 find_violations = _CHECKER.find_violations
 Violation = _CHECKER.Violation
+# The acquisition seam. The checker delegates every read to it, so these tests
+# replace the seam's entry points — which is also the proof that the checker
+# itself fetches nothing: a test that had to fake a socket to exercise `main`
+# would be testing the wrong layer.
+pr_body_source = _CHECKER.pr_body_source
 
 
 def _patterns(body: str) -> set[str]:
@@ -262,48 +268,40 @@ class TestBotAuthoredBodiesAreSkipped(unittest.TestCase):
     def test_bot_author_short_circuits_to_zero(self):
         calls = []
 
-        def fake_fetch(repo, pr, token):
+        def fake_fetch(repo, pr, token=None):
             calls.append((repo, pr))
-            return ("- item\ncontinuation at column zero\n", True)
+            return pr_body_source.Body(
+                "- item\ncontinuation at column zero\n", True
+            )
 
-        original = _CHECKER._fetch_body
-        _CHECKER._fetch_body = fake_fetch
-        try:
-            with unittest.mock.patch.dict(
-                os.environ, {"GITHUB_TOKEN": "tok"}
-            ):
-                rc = _CHECKER.main(["--repo", "o/r", "--pr", "7"])
-        finally:
-            _CHECKER._fetch_body = original
+        with unittest.mock.patch.object(
+            pr_body_source, "fetch_pull_request", fake_fetch
+        ), unittest.mock.patch.dict(os.environ, {"GITHUB_TOKEN": "tok"}):
+            rc = _CHECKER.main(["--repo", "o/r", "--pr", "7"])
         self.assertEqual(rc, 0)
         self.assertEqual(calls, [("o/r", 7)])
 
     def test_human_author_with_violation_still_red(self):
-        def fake_fetch(repo, pr, token):
-            return ("- item\ncontinuation at column zero\n", False)
+        def fake_fetch(repo, pr, token=None):
+            return pr_body_source.Body(
+                "- item\ncontinuation at column zero\n", False
+            )
 
-        original = _CHECKER._fetch_body
-        _CHECKER._fetch_body = fake_fetch
-        try:
-            with unittest.mock.patch.dict(
-                os.environ, {"GITHUB_TOKEN": "tok"}
-            ):
-                rc = _CHECKER.main(["--repo", "o/r", "--pr", "7"])
-        finally:
-            _CHECKER._fetch_body = original
+        with unittest.mock.patch.object(
+            pr_body_source, "fetch_pull_request", fake_fetch
+        ), unittest.mock.patch.dict(os.environ, {"GITHUB_TOKEN": "tok"}):
+            rc = _CHECKER.main(["--repo", "o/r", "--pr", "7"])
         self.assertEqual(rc, 1)
 
     def test_failed_read_is_degraded_not_clean(self):
         # A failed API read must never be reported as "no violations".
-        def fake_fetch(repo, pr, token):
-            raise RuntimeError("gh api failed (1): boom")
+        def fake_fetch(repo, pr, token=None):
+            raise pr_body_source.BodyReadError("GET failed (403 Forbidden)")
 
-        original = _CHECKER._fetch_body
-        _CHECKER._fetch_body = fake_fetch
-        try:
+        with unittest.mock.patch.object(
+            pr_body_source, "fetch_pull_request", fake_fetch
+        ):
             rc = _CHECKER.main(["--repo", "o/r", "--pr", "7"])
-        finally:
-            _CHECKER._fetch_body = original
         self.assertEqual(rc, 2)
 
 
@@ -517,8 +515,8 @@ class TestCommentModeFetchAndMain(unittest.TestCase):
         with mock.patch(
             "urllib.request.urlopen", return_value=io.BytesIO(payload)
         ) as urlopen:
-            body, is_bot = _CHECKER._fetch_comment("o/r", 4242, "tok-123")
-        self.assertEqual((body, is_bot), ("a clean comment", False))
+            body = pr_body_source.fetch_comment("o/r", 4242, "tok-123")
+        self.assertEqual((body.text, body.is_bot), ("a clean comment", False))
         (req,), kwargs = urlopen.call_args
         self.assertEqual(
             req.full_url, "https://api.github.com/repos/o/r/issues/comments/4242"
@@ -537,55 +535,52 @@ class TestCommentModeFetchAndMain(unittest.TestCase):
         with mock.patch(
             "urllib.request.urlopen", return_value=io.BytesIO(payload)
         ):
-            body, is_bot = _CHECKER._fetch_comment("o/r", 4242, "tok")
-        self.assertTrue(is_bot)
+            body = pr_body_source.fetch_comment("o/r", 4242, "tok")
+        self.assertTrue(body.is_bot)
 
     def test_main_comment_mode_flags_violation(self):
         calls = []
 
-        def fake_fetch_comment(repo, comment_id, token):
+        def fake_fetch_comment(repo, comment_id, token=None):
             calls.append((repo, comment_id))
             # A leading file reference above real content — the paste-instead-
             # of-contents bug, which only fires in comment mode.
-            return ("@/tmp/cite-reply.md\n\nThe rest of the reply.\n", False)
+            return pr_body_source.Body(
+                "@/tmp/cite-reply.md\n\nThe rest of the reply.\n", False
+            )
 
-        original = _CHECKER._fetch_comment
-        _CHECKER._fetch_comment = fake_fetch_comment
-        try:
-            with unittest.mock.patch.dict(os.environ, {"GITHUB_TOKEN": "tok"}):
-                rc = _CHECKER.main(["--repo", "o/r", "--comment", "4242"])
-        finally:
-            _CHECKER._fetch_comment = original
+        with unittest.mock.patch.object(
+            pr_body_source, "fetch_comment", fake_fetch_comment
+        ), unittest.mock.patch.dict(os.environ, {"GITHUB_TOKEN": "tok"}):
+            rc = _CHECKER.main(["--repo", "o/r", "--comment", "4242"])
         self.assertEqual(rc, 1)
         self.assertEqual(calls, [("o/r", 4242)])
 
     def test_main_comment_mode_clean_body_returns_zero(self):
-        def fake_fetch_comment(repo, comment_id, token):
-            return ("A clean reply.\n\nWith a second paragraph.\n", False)
+        def fake_fetch_comment(repo, comment_id, token=None):
+            return pr_body_source.Body(
+                "A clean reply.\n\nWith a second paragraph.\n", False
+            )
 
-        original = _CHECKER._fetch_comment
-        _CHECKER._fetch_comment = fake_fetch_comment
-        try:
-            with unittest.mock.patch.dict(os.environ, {"GITHUB_TOKEN": "tok"}):
-                rc = _CHECKER.main(["--repo", "o/r", "--comment", "1"])
-        finally:
-            _CHECKER._fetch_comment = original
+        with unittest.mock.patch.object(
+            pr_body_source, "fetch_comment", fake_fetch_comment
+        ), unittest.mock.patch.dict(os.environ, {"GITHUB_TOKEN": "tok"}):
+            rc = _CHECKER.main(["--repo", "o/r", "--comment", "1"])
         self.assertEqual(rc, 0)
 
     def test_main_comment_mode_bot_author_skipped(self):
         calls = []
 
-        def fake_fetch_comment(repo, comment_id, token):
+        def fake_fetch_comment(repo, comment_id, token=None):
             calls.append(comment_id)
-            return ("- item\ncontinuation at column zero\n", True)
+            return pr_body_source.Body(
+                "- item\ncontinuation at column zero\n", True
+            )
 
-        original = _CHECKER._fetch_comment
-        _CHECKER._fetch_comment = fake_fetch_comment
-        try:
-            with unittest.mock.patch.dict(os.environ, {"GITHUB_TOKEN": "tok"}):
-                rc = _CHECKER.main(["--repo", "o/r", "--comment", "9"])
-        finally:
-            _CHECKER._fetch_comment = original
+        with unittest.mock.patch.object(
+            pr_body_source, "fetch_comment", fake_fetch_comment
+        ), unittest.mock.patch.dict(os.environ, {"GITHUB_TOKEN": "tok"}):
+            rc = _CHECKER.main(["--repo", "o/r", "--comment", "9"])
         self.assertEqual(rc, 0)
         self.assertEqual(calls, [9])
 
@@ -615,15 +610,13 @@ class TestCommentModeFetchAndMain(unittest.TestCase):
         self.assertEqual(rc, 2)
 
     def test_main_comment_mode_failed_read_is_degraded_not_clean(self):
-        def fake_fetch_comment(repo, comment_id, token):
-            raise RuntimeError("boom")
+        def fake_fetch_comment(repo, comment_id, token=None):
+            raise pr_body_source.BodyReadError("GET failed (404 Not Found)")
 
-        original = _CHECKER._fetch_comment
-        _CHECKER._fetch_comment = fake_fetch_comment
-        try:
+        with unittest.mock.patch.object(
+            pr_body_source, "fetch_comment", fake_fetch_comment
+        ):
             rc = _CHECKER.main(["--repo", "o/r", "--comment", "9"])
-        finally:
-            _CHECKER._fetch_comment = original
         self.assertEqual(rc, 2)
 
 
@@ -686,11 +679,13 @@ class TestFileReferenceOpensAComment(unittest.TestCase):
 
 
 class TestFetchBodyUsesRestApiDirectly(unittest.TestCase):
-    """The checker talks to the REST API over HTTPS — no gh CLI required.
+    """The acquisition talks to the REST API over HTTPS — no CLI required.
 
-    Shelling out to `gh` made every user install the CLI just to run the
-    check. urllib is in the standard library, so the live-fetch path needs
-    nothing but a token in the environment.
+    Shelling out to the GitHub CLI made every user install the tool just to run
+    the check. urllib is in the standard library, so the live-fetch path needs
+    nothing but a token in the environment. The read itself lives in
+    scripts/pr_body_source.py now; these tests pin the contract the checker
+    depends on.
     """
 
     def test_fetch_body_hits_rest_api_with_bearer_token(self):
@@ -705,8 +700,8 @@ class TestFetchBodyUsesRestApiDirectly(unittest.TestCase):
         with mock.patch(
             "urllib.request.urlopen", return_value=fake_resp
         ) as urlopen:
-            body, is_bot = _CHECKER._fetch_body("o/r", 7, "tok-123")
-        self.assertEqual((body, is_bot), ("a clean body", False))
+            body = pr_body_source.fetch_pull_request("o/r", 7, "tok-123")
+        self.assertEqual((body.text, body.is_bot), ("a clean body", False))
         (req,), kwargs = urlopen.call_args
         self.assertEqual(req.full_url, "https://api.github.com/repos/o/r/pulls/7")
         self.assertEqual(req.get_header("Authorization"), "Bearer tok-123")
@@ -723,8 +718,8 @@ class TestFetchBodyUsesRestApiDirectly(unittest.TestCase):
         with mock.patch(
             "urllib.request.urlopen", return_value=io.BytesIO(payload)
         ):
-            body, is_bot = _CHECKER._fetch_body("o/r", 7, "tok")
-        self.assertTrue(is_bot)
+            body = pr_body_source.fetch_pull_request("o/r", 7, "tok")
+        self.assertTrue(body.is_bot)
 
     def test_missing_token_is_usage_failure_not_clean(self):
         # A live fetch without a token must exit 2 (read failure), never 0.
@@ -736,6 +731,24 @@ class TestFetchBodyUsesRestApiDirectly(unittest.TestCase):
         with mock.patch.dict(os.environ, env, clear=True):
             rc = _CHECKER.main(["--repo", "o/r", "--pr", "7"])
         self.assertEqual(rc, 2)
+
+    def test_gh_token_alone_reads_the_body(self):
+        # The divergence this refactor closed: `GH_TOKEN` is the documented
+        # fallback, and a caller exporting only that must get the same verdict
+        # as one exporting `GITHUB_TOKEN`.
+        from unittest import mock
+
+        def fake_fetch(repo, pr, token=None):
+            return pr_body_source.Body("- item\nwrapped at column zero\n", False)
+
+        env = {k: v for k, v in os.environ.items()}
+        env.pop("GITHUB_TOKEN", None)
+        env["GH_TOKEN"] = "tok"
+        with mock.patch.object(
+            pr_body_source, "fetch_pull_request", fake_fetch
+        ), mock.patch.dict(os.environ, env, clear=True):
+            rc = _CHECKER.main(["--repo", "o/r", "--pr", "7"])
+        self.assertEqual(rc, 1)
 
     def test_http_error_is_degraded_not_clean(self):
         from unittest import mock
@@ -753,12 +766,85 @@ class TestFetchBodyUsesRestApiDirectly(unittest.TestCase):
         self.assertEqual(rc, 2)
 
     def test_no_gh_subprocess_anywhere_in_the_checker(self):
-        # The point of the change: the source never invokes the gh CLI.
-        with open(_SCRIPT, encoding="utf-8") as fh:
+        # The point of the change: the source never invokes the GitHub CLI. It
+        # used to be one file's property; the read moved into a sibling module,
+        # so the property now covers both — a subprocess in the seam would
+        # reintroduce the tool this gate was built to stop requiring.
+        for script in (_SCRIPT, _SEAM):
+            with open(script, encoding="utf-8") as fh:
+                source = fh.read()
+            with self.subTest(script=os.path.basename(script)):
+                self.assertNotIn("subprocess", source)
+                self.assertNotIn("'gh'", source)
+                self.assertNotIn('"gh"', source)
+
+    def test_seam_uses_only_the_standard_library(self):
+        # A CI gate that parses attacker-influenceable PR text is the last place
+        # to grow a dependency; the decision is recorded in this checker's
+        # docstring, so the test that holds it belongs beside it.
+        with open(_SEAM, encoding="utf-8") as fh:
             source = fh.read()
-        self.assertNotIn("subprocess", source)
-        self.assertNotIn("'gh'", source)
-        self.assertNotIn('"gh"', source)
+        imported = [
+            line.split()[1].split(".")[0]
+            for line in source.splitlines()
+            if line.startswith("import ")
+        ]
+        allowed = {"json", "os", "sys", "urllib", "dataclasses", "__future__"}
+        self.assertTrue(set(imported) <= allowed, imported)
+
+
+class TestAcquisitionSeamSources(unittest.TestCase):
+    """Every source a body can arrive from, and the one rule about failing.
+
+    These four behaviours are the seam's whole contract. They used to be
+    re-implemented per checker, which is how the prose checker ended up reading
+    a token the others did not.
+    """
+
+    def test_file_source_reads_the_body(self):
+        import tempfile
+
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".md", delete=False, encoding="utf-8"
+        ) as handle:
+            handle.write("A body from a file.\n")
+            path = handle.name
+        try:
+            self.assertEqual(
+                pr_body_source.read_body_file(path), "A body from a file.\n"
+            )
+        finally:
+            os.unlink(path)
+
+    def test_dash_reads_stdin(self):
+        import io
+
+        self.assertEqual(
+            pr_body_source.read_body_file("-", stdin=io.StringIO("piped in\n")),
+            "piped in\n",
+        )
+
+    def test_unreadable_file_raises_the_one_error_type(self):
+        with self.assertRaises(pr_body_source.BodyReadError):
+            pr_body_source.read_body_file("/nonexistent/body.md")
+
+    def test_token_precedence_prefers_github_token(self):
+        self.assertEqual(
+            pr_body_source.resolve_token(
+                {"GITHUB_TOKEN": "from-github", "GH_TOKEN": "from-gh"}
+            ),
+            "from-github",
+        )
+
+    def test_token_precedence_falls_back_to_gh_token(self):
+        self.assertEqual(
+            pr_body_source.resolve_token({"GH_TOKEN": "from-gh"}), "from-gh"
+        )
+
+    def test_empty_token_is_not_a_token(self):
+        self.assertIsNone(
+            pr_body_source.resolve_token({"GITHUB_TOKEN": "", "GH_TOKEN": ""})
+        )
 
 
 class TestEmptyBody(unittest.TestCase):
