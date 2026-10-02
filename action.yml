@@ -102,21 +102,11 @@ runs:
         VALE_VERSION: ${{ inputs.vale-version }}
       run: |
         set -euo pipefail
-        arch=$(uname -m)
-        case "$arch" in
-          x86_64) asset=64-bit ;;
-          aarch64|arm64) asset=arm64 ;;
-          *) echo "::error::vale has no release asset for $arch"; exit 2 ;;
-        esac
-        url="https://github.com/errata-ai/vale/releases/download/v${VALE_VERSION}/vale_${VALE_VERSION}_Linux_${asset}.tar.gz"
-        # Into RUNNER_TEMP, not /usr/local/bin: the latter needs root on some
-        # self-hosted runners and this step has no reason to need it.
-        bin="${RUNNER_TEMP:-/tmp}/vale-bin"
-        mkdir -p "$bin"
-        curl -fsSL "$url" | tar -xz -C "$bin" vale
-        chmod +x "$bin/vale"
-        echo "$bin" >> "$GITHUB_PATH"
-        "$bin/vale" --version
+        # The install lives in one script that ci.yml calls too, so the
+        # architecture switch and the RUNNER_TEMP destination (and not
+        # /usr/local/bin, which needs root on some self-hosted runners) are
+        # decided in a single place.
+        echo "$(${{ github.action_path }}/scripts/install-vale.sh)" >> "$GITHUB_PATH"
 
     # Every decision the action makes lives in one script, because every one of
     # them is a rule: which surface to check, which checkers to run and in what

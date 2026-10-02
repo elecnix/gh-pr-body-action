@@ -60,13 +60,12 @@ jobs:
       - name: Install vale
         env:
           VALE_VERSION: '3.20.0'
+        # The same installer the composite action calls. This job used to
+        # hardcode the 64-bit release asset, so it could not install vale at
+        # all on an aarch64 runner.
         run: |
           set -euo pipefail
-          url="https://github.com/errata-ai/vale/releases/download/v${VALE_VERSION}/vale_${VALE_VERSION}_Linux_64-bit.tar.gz"
-          mkdir -p "$RUNNER_TEMP/vale-bin"
-          curl -fsSL "$url" | tar -xz -C "$RUNNER_TEMP/vale-bin" vale
-          chmod +x "$RUNNER_TEMP/vale-bin/vale"
-          echo "$RUNNER_TEMP/vale-bin" >> "$GITHUB_PATH"
+          echo "$(scripts/install-vale.sh)" >> "$GITHUB_PATH"
 
       - name: Prose checker unit tests
         run: |

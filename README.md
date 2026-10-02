@@ -81,7 +81,7 @@ Without it the prose step reports "skipped, no rules found" and the job stays gr
 | `pr` | `github.event.pull_request.number` | pull-request number |
 | `comment` | `github.event.comment.id` | PR-comment id. When set, the format checker runs against that comment instead of the PR description (the mermaid checker has no comment mode and is skipped, and so is the prose check, which lints a description). Wiring both `comment` and `pr` is an error. |
 | `token` | `github.token` | token used to read the PR body (`pull-requests: read` suffices) |
-| `node-version` | `22` | Node major for the mermaid checker |
+| `node-version` | `24` | Node major for the mermaid checker |
 | `prose` | `true` | lint the description against your repo's own prose rules. Set to `false` to turn the step off. |
 | `prose-fail` | `false` | whether a prose finding fails the job. See [Prose](#prose-your-rules-not-ours). |
 | `prose-rules-dir` | `github.workspace` | directory holding your `.vale.ini` |
