@@ -71,7 +71,10 @@ it ragged. The calibration set is described in scripts/check-pr-body-format.py.
 Seven shapes are deliberately NOT flagged. The first four each fired on a real
 body in an earlier draft of this check; the last three are latent — zero
 occurrences in the corpus, suppressed because the house style produces them. All
-seven are pinned by a test:
+seven are pinned by a test — as prose there, and as data in the `SUPPRESSIONS`
+registry below, which carries each one's evidence class and the body that pins
+it. This write-up stays the narrative; the registry is the part that can drift
+without being noticed:
 
   * the `— <handle>` signature footer AGENTS.md mandates (it renders as its own
     line, which is the intent);
@@ -173,6 +176,8 @@ if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
 # pylint: disable=wrong-import-position
+from dataclasses import dataclass
+
 from finding import Finding, render_report
 
 # The acquisition seam: this checker does not read the PR body, it asks
@@ -238,6 +243,178 @@ _CONTINUATION_START = re.compile(r"^\s*[a-z0-9:;,—–]")
 # leading `/`, or a file extension, optionally under directories) so an
 # `@username` or `@org/team` mention-only body is not flagged.
 _FILE_REFERENCE = re.compile(r"^@(?:\S*/\S*\.\w{1,5}|/\S+|\S+\.\w{1,5})$")
+
+
+
+
+# The evidence class of a suppression, and what it means for the registry below.
+# `measured` — the shape fired on a real body in an earlier draft of this check,
+#   so the exemption was bought by a false positive that actually happened.
+# `latent` — zero occurrences in the calibration corpus; the shape is excused on
+#   the reasoning that house style produces it, not on an observation.
+_MEASURED = "measured"
+_LATENT = "latent"
+
+
+@dataclass(frozen=True)
+class Suppression:
+    """One shape this check knowingly leaves alone.
+
+    The module docstring is where the *why* is argued; this is where the same
+    decision is recorded as something a test can read. The prose can rot
+    silently — a rationale can describe a rule that has since been deleted, and
+    a calibration claim can outlive the corpus it came from, with nothing to
+    notice either. These fields are the machine-checkable half: a body that must
+    come back clean, a near-miss that must not, the evidence class, and the regex
+    the exemption actually rides on.
+
+    `guards` names the violation patterns the exemption keeps quiet, empty for a
+    gate-level skip that happens before any pattern is matched. `exempts_on_match`
+    records which way the `rule` decides: for six of the seven the shape IS the
+    match, and for the one that is excused by a non-match (a line opening with a
+    hyphen-minus is not a continuation) it is False.
+    """
+
+    name: str
+    guards: tuple[str, ...]
+    evidence: str
+    rationale: str
+    witness: str
+    control: str = ""
+    rule: re.Pattern[str] | None = None
+    exempts_on_match: bool = True
+
+
+# The seven suppressions, in the order the module docstring lists them: four
+# measured, then three latent. Adding an eighth means adding a numbered bullet
+# up there too — the two lists are meant to be the same list, and the test that
+# pins the census is what keeps them from quietly diverging.
+#
+# `_classify` keeps its flat, ordered arms rather than dispatching through this
+# registry: the entries are heterogeneous — a line-classifier arm, a table-cell
+# rule, a continuation-marker rule, and one pre-gate skip in `main` — and a
+# uniform dispatch over four different kinds of thing would read worse than the
+# sequence it replaces. What the registry buys is the drift guard: every entry
+# names the live regex it depends on, so renaming or deleting that regex breaks
+# module load instead of quietly orphaning an exemption.
+SUPPRESSIONS: tuple[Suppression, ...] = (
+    Suppression(
+        name="signature-footer",
+        guards=("hard-newline-in-paragraph",),
+        evidence=_MEASURED,
+        rationale="The mandated signature is meant to render on its own line, so "
+        "the break above it is the intent rather than a defect.",
+        rule=_SIGNATURE,
+        witness=(
+            "Linked: [ABC-2041](https://tracker.example.com/issue/ABC-2041)\n"
+            "— mossy-otter-22 \U0001f916\n"
+        ),
+        control=(
+            "The parser reads the schema's version from the header\n"
+            "— which is why the header has to arrive before the body\n"
+        ),
+    ),
+    Suppression(
+        name="aligned-table-separator",
+        guards=("collapsed-table",),
+        evidence=_MEASURED,
+        rationale="The alignment colon is part of the cell, not evidence of a "
+        "data row sharing the line with the separator.",
+        rule=_SEP_CELL,
+        witness=(
+            "| Gate | Result |\n"
+            "| -- | --: |\n"
+            "| a | b |\n"
+        ),
+        control="| A | B |\n| :-- | --: | a1 | b1 |\n",
+    ),
+    Suppression(
+        name="indented-list-items",
+        guards=("hard-newline-in-paragraph",),
+        evidence=_MEASURED,
+        rationale="A bullet is a bullet at any indent; leading whitespace must "
+        "not demote it to prose and make a block of them look wrapped.",
+        rule=_ULIST,
+        witness="  - first item\n  - second item\n",
+        control=(
+            "The batch id is minted once per upload\n"
+            "and stashed for the retry worker\n"
+        ),
+    ),
+    Suppression(
+        name="bot-authored-bodies",
+        guards=(),
+        evidence=_MEASURED,
+        rationale="A machine-generated changelog dump is not a review surface "
+        "any human wrote, so the gate skips it before matching anything.",
+        rule=None,
+        witness="- item\ncontinuation at column zero\n",
+    ),
+    Suppression(
+        name="bold-pseudo-heading",
+        guards=("hard-newline-in-paragraph",),
+        evidence=_LATENT,
+        rationale="A whole-line bold lead-in heads the paragraph beneath it, "
+        "so the newline after it is intended.",
+        rule=_BOLD_HEADING,
+        witness=(
+            "**Fail-open by design.**\n"
+            "the upload still proceeds when the lookup call times out.\n"
+        ),
+        control=(
+            "**Fail-open by design** — the deliberate opposite of the\n"
+            "fail-closed posture the upload path takes.\n"
+        ),
+    ),
+    Suppression(
+        name="setext-underline-and-rule",
+        guards=("hard-newline-in-paragraph",),
+        evidence=_LATENT,
+        rationale="An underline and a horizontal rule are structural markers, "
+        "not prose lines that happen to open with a dash or an equals sign.",
+        rule=_RULE,
+        witness="A heading in setext form\n========================\n",
+        control=(
+            "Run the batch and then wait\n"
+            "for the worker to drain the queue\n"
+        ),
+    ),
+    Suppression(
+        name="dash-placeholder-line",
+        guards=("hard-newline-in-paragraph",),
+        evidence=_LATENT,
+        rationale="A hyphen-minus opening is a flag name, a placeholder, or a "
+        "rule — never a sentence continuing, so it is excluded from the "
+        "continuation markers on purpose.",
+        rule=_CONTINUATION_START,
+        witness="Run it with the flag\n--force-with-lease is required.\n",
+        control=(
+            "The parser reads the schema's version from the header\n"
+            "and the header has to arrive first\n"
+        ),
+        # The exemption IS the non-match: the line opens with a hyphen-minus, so
+        # the continuation-marker rule declines to fire and the break stands.
+        exempts_on_match=False,
+    ),
+)
+
+
+def _rule_applies(rule: re.Pattern[str], body: str) -> bool:
+    """Whether `rule` matches any line of `body`, or any cell of a pipe row in it.
+
+    These regexes carry `^`/`$` without `re.MULTILINE` because they are applied
+    at a fixed granularity — `_classify` on one line, `_SEP_CELL` on one cell of
+    a row — never to a whole body. Running one over the raw body answers a
+    different question and silently says no, so the registry's `rule` field is
+    probed at both of the granularities this check actually uses.
+    """
+    for line in body.split("\n"):
+        if rule.search(line):
+            return True
+        if _UNESCAPED_PIPE.search(line):
+            if any(rule.search(cell) for cell in _row_cells(line)):
+                return True
+    return False
 
 
 def _classify(line: str) -> str:
