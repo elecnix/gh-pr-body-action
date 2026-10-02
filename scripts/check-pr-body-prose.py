@@ -80,6 +80,12 @@ _PACKAGES = re.compile(r"^\s*Packages\s*=", re.MULTILINE)
 # so its text is defanged before it can be echoed into a runner's log.
 _WORKFLOW_COMMAND = re.compile(r"^(\s*)::")
 
+# One sentence, two callers. `lint()` owns the guard — it is the seam that
+# promises status 2 for "vale could not run" — and `main()` repeats it only so a
+# missing vale costs no body read (and, with --repo/--pr, no network round trip).
+# A linter that could not start has not passed, and both paths say the same.
+_VALE_MISSING = "vale is not installed, so no verdict is safe."
+
 
 def _defang(line: str) -> str:
     return _WORKFLOW_COMMAND.sub(r"\1:​:", line)
@@ -107,7 +113,14 @@ def lint(body: str, config: str, rules_dir: str, sync: bool = True) -> tuple[int
 
     Status 0 clean, 1 alerts, 2 vale could not run. The alert count comes from
     vale's JSON, never from its exit code — see the module docstring on warnings.
+
+    Status 2 is this function's own promise, so the guard that keeps it belongs
+    here and not in the caller: with vale off PATH this returns 2 rather than
+    letting FileNotFoundError escape.
     """
+    if shutil.which("vale") is None:
+        return 2, _VALE_MISSING
+
     if sync and _PACKAGES.search(_read_text(config)):
         try:
             _sync(config, rules_dir)
@@ -216,7 +229,9 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if shutil.which("vale") is None:
-        print("prose: vale is not installed, so no verdict is safe.", file=sys.stderr)
+        # Duplicated from lint() on purpose: cheap, and it keeps the "cannot
+        # run" verdict ahead of reading the body at all.
+        print(f"prose: {_VALE_MISSING}", file=sys.stderr)
         return 2
 
     if args.body_file:

@@ -175,6 +175,56 @@ class ExtensionTrap(unittest.TestCase):
             self.assertIn("clean", buffer.getvalue())
 
 
+class ValeMissing(unittest.TestCase):
+    """`lint()` keeps its own promise: status 2, never a raised FileNotFoundError.
+
+    Deliberately *not* skipped when vale is installed — the guard under test is
+    the PATH being unusable, and these calls must return 2 on every machine.
+    """
+
+    def _without_vale_on_path(self):
+        """A PATH with no directory that could hold vale, restored afterwards."""
+        saved = os.environ.get("PATH")
+        os.environ["PATH"] = os.path.join(tempfile.gettempdir(), "no-vale-here")
+        self.addCleanup(self._restore_path, saved)
+
+    @staticmethod
+    def _restore_path(saved):
+        if saved is None:
+            os.environ.pop("PATH", None)
+        else:
+            os.environ["PATH"] = saved
+
+    def test_lint_returns_two_when_vale_is_absent(self):
+        """The seam is what keeps the promise, not the argument parser."""
+        with tempfile.TemporaryDirectory() as root:
+            config = _write_rules(root)
+            self._without_vale_on_path()
+
+            status, report = prose.lint(
+                "Ordinary prose sits here.\n", config, root, sync=False
+            )
+
+        self.assertEqual(status, 2, report)
+        self.assertIn("vale is not installed", report)
+        self.assertIn("no verdict is safe", report)
+
+    def test_the_guard_precedes_sync_so_the_message_is_the_true_one(self):
+        """The config pins packages, so sync would fail as well — but with the
+        wrong story ("the pinned rules are missing") if the guard came second."""
+        with tempfile.TemporaryDirectory() as root:
+            config = _write_rules(root)
+            with open(config, "a", encoding="utf-8") as handle:
+                handle.write("Packages = example\n")
+            self._without_vale_on_path()
+
+            status, report = prose.lint("Ordinary prose sits here.\n", config, root)
+
+        self.assertEqual(status, 2, report)
+        self.assertIn("vale is not installed", report)
+        self.assertNotIn("vale sync failed", report)
+
+
 class NoRules(unittest.TestCase):
     def test_repo_without_rules_is_skipped_and_says_why(self):
         with tempfile.TemporaryDirectory() as root:
