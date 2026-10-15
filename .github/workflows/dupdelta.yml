@@ -1,0 +1,28 @@
+# DRY regression check: report only the code duplication a pull request
+# introduces, compared against its merge-base. Pre-existing duplication stays
+# silent, so findings stay relevant to the change under review.
+#
+# Advisory by design: the action warns inline and never fails the build, so it
+# is deliberately not in the branch-protection required contexts.
+name: dupdelta
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dupdelta-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  dupdelta:
+    runs-on: ubuntu-latest
+    steps:
+      # The merge-base has to be reachable; a shallow clone makes the delta
+      # meaningless (see the action's own shallow-checkout error).
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: elecnix/dupdelta@v0.2.0
