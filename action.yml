@@ -1,8 +1,5 @@
 name: 'PR Body Format'
-description: >-
-  Flags a pull-request description that will render badly on GitHub: prose
-  hard-wrapped mid-sentence, list items broken onto a second line, collapsed
-  tables, and mermaid diagrams the mermaid parser rejects.
+description: 'Flags PR descriptions that render badly on GitHub: hard-wrapped prose, broken list items, collapsed tables, invalid mermaid.'
 author: 'elecnix'
 
 branding:
