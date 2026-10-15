@@ -23,5 +23,5 @@ jobs:
       # rules found" here — which is the behaviour worth dogfooding. The
       # checkout is what lets it look at all; without one the step could not
       # tell "no rules" from "no checkout".
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: elecnix/gh-pr-body-action@v1
